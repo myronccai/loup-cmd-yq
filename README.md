@@ -1,18 +1,19 @@
 # loup-cmd-yq
 
-[yq](https://github.com/kislyuk/yq) written as a
-[Loup](https://code-craft.ai/references/loup) script: it reads YAML files
+[yq](https://github.com/kislyuk/yq) written as
+[Loup](https://code-craft.ai/references/loup) scripts: `yq` reads YAML files
 and runs a [jq](https://jqlang.org) filter on every document, printing the
-results as JSON, raw text or YAML. The filter language is a substantial
-jq subset (paths, pipes, construction, operators, conditionals, variables,
-string interpolation, formats and about seventy builtins), evaluated with
-generators.
+results as JSON, raw text or YAML; its siblings `xq` and `tomlq` do the
+same for XML and TOML files, as in Python's yq. The filter language is a
+substantial jq subset (paths, pipes, construction, operators,
+conditionals, variables, string interpolation, formats and about seventy
+builtins), evaluated with generators.
 
 Part of the **loup-cmd** series of example applications: classic Linux and
 Windows commands, and projects for each Loup execution mode, each in its own
 repository under [myronccai](https://github.com/myronccai?tab=repositories&q=loup-cmd).
-This one is a `host.scripted` command: an `.lpscr` entry script in `bin/`
-over `.lpscr` modules in `lib/`, run with `loup run`.
+This one is a `host.scripted` command: three `.lpscr` entry scripts in
+`bin/` over `.lpscr` modules in `lib/`, run with `loup run`.
 
 ## Requirements
 
@@ -71,11 +72,13 @@ license: <https://code-craft.ai/loup/license>.
 ## Usage
 
 ```sh
-make run ARGS="-c .services[0] tests/fixtures/services.yaml"   # loup run bin/yq.lpscr -- ARGS
-make ci                                                        # check, unit tests, end-to-end tests
+make run ARGS="-c .services[0] tests/fixtures/services.yaml"         # loup run bin/yq.lpscr -- ARGS
+make run APP=xq ARGS="-c .project.version tests/fixtures/pom.xml"    # loup run bin/xq.lpscr -- ARGS
+make run APP=tomlq ARGS=".project.name tests/fixtures/pyproject.toml"
+make ci                                                              # check, unit tests, end-to-end tests
 ```
 
-The script is executable (`#!/usr/bin/env -S loup run`). Short options
+Each script is executable (`#!/usr/bin/env -S loup run`). Short options
 (`-r`, `-c`, `-y`, ...) pass straight through `loup run`; long ones
 (`--arg`, `--indent`, `--yaml-output`) must follow a `--`, which `make run`
 adds for you. With [`tests/fixtures/services.yaml`](tests/fixtures/services.yaml),
@@ -119,6 +122,50 @@ yq: 1 compile error
 status 3
 ```
 
+`xq` reads each XML file as one input: an object whose key is the root
+element's name. Attributes become `@name` keys, child elements keys of
+their own (an array when a name repeats), text `#text` (or the whole value,
+when an element has nothing else), and an empty element is `null`. With
+[`tests/fixtures/pom.xml`](tests/fixtures/pom.xml), a Maven project file:
+
+```text
+$ ./bin/xq.lpscr -r '.project.dependencies.dependency[] | "\(.groupId):\(.artifactId):\(.version)"' pom.xml
+org.springframework.boot:spring-boot-starter-web:3.3.4
+com.fasterxml.jackson.core:jackson-databind:${jackson.version}
+org.junit.jupiter:junit-jupiter:5.11.2
+$ ./bin/xq.lpscr '.project | {name, description, release: .build.plugins.plugin.configuration."@release"}' pom.xml
+{
+  "name": "Shop API & Admin",
+  "description": "Orders, carts & <b>stock</b>.",
+  "release": "21"
+}
+$ ./bin/xq.lpscr -c '.project.build.plugins.plugin | type' pom.xml
+"object"
+$ ./bin/xq.lpscr -- -c --xml-force-list plugin '.project.build.plugins.plugin | type' pom.xml
+"array"
+$ ./bin/xq.lpscr . broken.xml; echo "status $?"
+xq: broken.xml:2: mismatched closing tag for <b>
+status 2
+```
+
+`tomlq` reads each TOML file as one input, its tables as objects. With
+[`tests/fixtures/pyproject.toml`](tests/fixtures/pyproject.toml):
+
+```text
+$ ./bin/tomlq.lpscr -r '.project.dependencies[]' pyproject.toml
+httpx>=0.27
+pydantic>=2.6,<3
+rich
+$ ./bin/tomlq.lpscr -y .tool.mypy pyproject.toml
+overrides:
+  - module: rich.*
+    ignore_missing_imports: true
+  - module: httpx.*
+    follow_imports: skip
+$ ./bin/tomlq.lpscr -c '.project | {name, version, extras: (."optional-dependencies" | keys)}' pyproject.toml
+{"name":"shop-client","version":"1.8.0","extras":["dev"]}
+```
+
 ### Options
 
 | Option | Meaning |
@@ -133,10 +180,12 @@ status 3
 | `-n`, `--null-input` | run the filter once on `null`, reading nothing |
 | `-e`, `--exit-status` | status 1 if the last result is `false` or `null`, 4 if there was none |
 | `--arg NAME VALUE` | set `$NAME` to the string VALUE |
-| `-h`, `--help` / `-V`, `--version` | help text / `yq (loup-cmd-yq) 0.1.0` |
+| `--xml-force-list NAME` | xq only: make every NAME element an array, even a single one (repeatable) |
+| `-h`, `--help` / `-V`, `--version` | help text / `yq (loup-cmd-yq) 0.1.0` (`xq (loup-cmd-yq) 0.1.0`, ...) |
 
-Short options combine (`-rc`); with no FILE, or a FILE of `-`, yq reads
-standard input.
+All three programs take the same options. Short options combine (`-rc`);
+with no FILE, or a FILE of `-`, they read standard input; `-s` gathers
+every input (every YAML document, every XML or TOML file) into one array.
 
 ### Filters
 
@@ -155,6 +204,17 @@ several lines), `|` and `>` block scalars with `-`/`+` chomping,
 multi-line plain scalars, single- and double-quoted keys and values,
 comments, and several documents per file.
 
+XML input (`xq`): elements, attributes, text, comments, processing
+instructions, CDATA sections, the five predefined entities and character
+references (`&#233;`, `&#xE9;`); a document type declaration is skipped,
+and references to the entities it declares are dropped, as in Python's
+xq. A document that is not well-formed (mismatched tags, an undefined
+entity, a stray `&`, a second root element) is reported with its line.
+
+TOML input (`tomlq`): TOML 1.0 through `data.toml`: tables, dotted keys,
+arrays of tables, inline tables, every string and number form; dates and
+times are strings.
+
 Exit status: `0` success, `1` last result false or null (`-e`), `2` usage
 error or unreadable input, `3` filter syntax error, `4` no result (`-e`),
 `5` error while running the filter.
@@ -171,8 +231,23 @@ error or unreadable input, `3` filter syntax error, `4` no result (`-e`),
   digits become floats; tabs do not indent.
 - `-y` writes its own block YAML (it differs from PyYAML's in details such
   as line wrapping); there is no `-Y`, `--width` or `--indentless`.
-- Errors read `yq: error: MESSAGE` without jq's `(at FILE:N)`; YAML errors
-  name the file and line.
+- Errors read `yq: error: MESSAGE` without jq's `(at FILE:N)`; YAML, XML
+  and TOML errors name the file and line, and the other files are still
+  read (Python's yq stops at the first, with status 2).
+- `xq` has no `-x`/`--xml-output`, `--xml-item-depth`, `--xml-dtd` or
+  `--xml-root`, and `tomlq` no `-t`/`--toml-output`: results are JSON or
+  YAML. There is no `-p`/`--input-format` either (that is the Go yq's): a
+  Loup program can load only one of `data.yaml`, `data.xml` and
+  `data.toml`, so each format has its program, as in Python's yq.
+- XML: whitespace in attribute values is kept as written (an XML parser
+  turns line breaks and tabs into spaces); entity declarations are never
+  read, so a document type declaration's entities are dropped wherever
+  they are used; an encoding other than UTF-8 is not converted.
+  `data.xml` takes time that grows with the square of the document's size:
+  about 10 seconds for 100 KB.
+- TOML: dates and times keep their TOML spelling (`1979-05-27 07:32:00Z`;
+  Python's tomlq writes `1979-05-27T07:32:00+00:00`), and integers beyond
+  64 bits do not read correctly.
 - `from_entries` also takes `k`, `v` and `name` keys, and `ltrimstr` /
   `rtrimstr` leave non-strings alone, as in jq 1.6 and 1.7.
 - Under the self-hosted `loup run` a generator runs to its end before the
@@ -189,7 +264,8 @@ error or unreadable input, `3` filter syntax error, `4` no result (`-e`),
 - **Errors carried as values.** A generator never lets an exception leave
   its body (Stage0 cannot catch one that does, and the self-hosted
   interpreter would lose the outputs before it): it yields a `Failure`, and
-  each consumer throws it again with `unwrap()`.
+  each consumer throws it again with `unwrap()`. A file or document that
+  cannot be read is an `InputError` value among the inputs.
 - **`Any`, safe casts and type matching, recursively.** YAML values are
   `Any`; `match v { int(n) => ..., string(s) => ... }` and
   `v as? dict[string, Any]` tell them apart, and jq's order, deep
@@ -198,21 +274,35 @@ error or unreadable input, `3` filter syntax error, `4` no result (`-e`),
 - **A small parser.** A lexer and a recursive-descent parser for the jq
   subset into a recursive `enum Node`, with string interpolation parsed by
   nested parsers and scope and arity checks at compile time.
-- **`data.yaml`** with the YAML it lacks handled around it, **`system.json`**
-  (`stringifyIndented`, `stringify`) for output, and **`system.collections`**
+- **Three programs, one command.** `lib/command.lpscr` is the whole
+  command; `bin/yq.lpscr`, `bin/xq.lpscr` and `bin/tomlq.lpscr` each pass
+  it their format (an enum) and their reader, a function value of type
+  `fn(string, string, Options): list[Any]`.
+- **`data.yaml`** with the YAML it lacks handled around it; **`data.xml`**
+  (`parse`, `Element`'s `findAll` and `text()`, `XmlParseError`) behind a
+  one-pass preparer for what it lacks (CDATA, character references,
+  well-formedness checks) and turned into xq's values; **`data.toml`**
+  (`parse`, `TomlParseError`); **`system.json`** (`stringifyIndented`) for
+  output, and **`system.collections`**
   (`reduce`, `any`, `all`, `rangeFrom`, `rangeStep`, `reverse`, `flatten`,
   `distinctBy`, `groupBy`, `sortBy`, `toEntries`, `fromEntries`,
   `mapValues`, `filterKeys`, `mergeWith`, `map`) for the builtins.
 - Also: a deferred import between the evaluator and the builtins, lambdas
-  passed to the collection helpers and a sort comparator, `global` state in
-  the entry script, `safe func`, sets for the builtin table, and a class
-  marker (`Missing`) tested with `is`.
+  passed to the collection helpers and a sort comparator, the run's state
+  in module variables changed through `global`, `safe func`, sets for the
+  builtin table, a class marker (`Missing`) tested with `is`, and compact
+  JSON written by yq itself (`json_text`): `data.xml` exports a
+  `stringify` that takes the place of `system.json`'s in any program that
+  loads it.
 
 ## Layout
 
 ```text
-bin/yq.lpscr                # the command (host.scripted entry script)
-lib/appinfo.loup            # name, version, exit statuses
+bin/yq.lpscr                # yq: YAML input (host.scripted entry script)
+bin/xq.lpscr                # xq: XML input
+bin/tomlq.lpscr             # tomlq: TOML input
+lib/command.lpscr           # the command the three share: inputs, filter, output, status
+lib/appinfo.loup            # name, version, the three formats, exit statuses
 lib/usage.loup              # --help and --version text
 lib/args.lpscr              # command line
 lib/lexer.lpscr             # filter tokens
@@ -223,10 +313,12 @@ lib/builtins.lpscr          # builtins and formats
 lib/values.lpscr            # jq's types, order, equality, arithmetic
 lib/flow.lpscr              # YAML flow collections and plain scalars
 lib/yamlin.lpscr            # YAML documents around data.yaml
+lib/xmlin.lpscr             # XML through data.xml, as xq's values
+lib/tomlin.lpscr            # TOML through data.toml
 lib/output.lpscr            # JSON, raw and YAML output
 tests/*_test.lpscr          # unit tests (make test)
 tests/e2e.sh                # end-to-end tests with loup run (make e2e)
-tests/fixtures/services.yaml  # sample input: two documents
+tests/fixtures/             # services.yaml (two documents), pom.xml, pyproject.toml
 specs/yq/                   # requirements, design, tasks
 ```
 

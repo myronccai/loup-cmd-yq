@@ -1,15 +1,45 @@
 @mode(host.dual)
 
-# Application identity and exit statuses for yq. Keep APP_NAME and
-# APP_VERSION in step with `name` and `version` in package.lppkg.
+# Application identity and exit statuses for yq and its two siblings, xq
+# (XML input) and tomlq (TOML input). Keep APP_NAME and APP_VERSION in
+# step with `name` and `version` in package.lppkg.
 #
-# Runtime: host.dual, but only ever interpreted here: bin/yq.lpscr and
-# lib/usage.loup import it under `loup run`, and the unit tests under
-# Stage0's test runner. It holds only constants, so it stays compilable.
+# Runtime: host.dual, but only ever interpreted here: the entry scripts in
+# bin/ and the lib/ modules import it under `loup run`, and the unit tests
+# under Stage0's test runner. It holds only constants, an enum and a
+# match, so it stays compilable.
 
 pub const APP_NAME: string = "yq";
 pub const APP_VERSION: string = "0.1.0";
-pub const APP_SUMMARY: string = "Query YAML with jq filters; print JSON or YAML.";
+
+# The three programs of the package, by the format each one reads. Each
+# is its own script (bin/yq.lpscr, bin/xq.lpscr, bin/tomlq.lpscr), as in
+# Python's yq: data.yaml, data.xml and data.toml each define a private
+# class `_Cursor`, and a program that imports two of them does not load
+# (E0001).
+pub enum InputFormat {
+    Yaml,
+    Xml,
+    Toml,
+}
+
+# The command name: yq, xq or tomlq.
+pub func program_name(format: InputFormat): string {
+    return match format {
+        InputFormat.Yaml => "yq",
+        InputFormat.Xml => "xq",
+        InputFormat.Toml => "tomlq",
+    };
+}
+
+# The format's name in help text.
+pub func format_name(format: InputFormat): string {
+    return match format {
+        InputFormat.Yaml => "YAML",
+        InputFormat.Xml => "XML",
+        InputFormat.Toml => "TOML",
+    };
+}
 
 # Exit statuses, as jq's.
 pub const EXIT_OK: int = 0;

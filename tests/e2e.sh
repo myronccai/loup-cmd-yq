@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end tests: run yq with `loup run` and compare its standard output,
-# standard error and exit status with the expected ones, on
-# tests/fixtures/services.yaml and on small inputs written here.
+# End-to-end tests: run yq, xq and tomlq with `loup run` and compare their
+# standard output, standard error and exit status with the expected ones,
+# on tests/fixtures/services.yaml, pom.xml and pyproject.toml and on small
+# inputs written here.
 #
 # usage: tests/e2e.sh [LOUP]     (run from the repository root)
 
@@ -14,7 +15,7 @@ trap 'rm -rf "$TMP"' EXIT
 pass=0
 fail=0
 
-# run ARGS...: the script with ARGS after `--` (so long options reach it),
+# run ARGS...: the script $SCRIPT with ARGS after `--` (so long options reach it),
 # standard input from the file named by $IN (default /dev/null), output to
 # $TMP/out and $TMP/err. Returns its exit status.
 run() {
@@ -160,6 +161,78 @@ status=$?
 head -1 "$TMP/out" > "$TMP/got"
 printf 'usage: yq [OPTION]... FILTER [FILE]...\n' > "$TMP/want"
 report "help" $status 0 "$TMP/want" "$TMP/got"
+check_err "no XML options in yq" 2 "yq: unrecognized option '--xml-force-list'
+$HINT
+" --xml-force-list item . "$YAML"
+
+# --- xq: XML input -------------------------------------------------------------
+
+SCRIPT=bin/xq.lpscr
+POM=tests/fixtures/pom.xml
+check "xq: elements, repeated" 0 $'org.springframework.boot:spring-boot-starter-web:3.3.4\ncom.fasterxml.jackson.core:jackson-databind:${jackson.version}\norg.junit.jupiter:junit-jupiter:5.11.2\n' -r '.project.dependencies.dependency[] | "\(.groupId):\(.artifactId):\(.version)"' "$POM"
+check "xq: select" 0 $'["spring-boot-starter-web","jackson-databind"]\n' -c '[.project.dependencies.dependency[] | select(.scope != "test") | .artifactId]' "$POM"
+check "xq: attributes, entities, CDATA" 0 '{
+  "name": "Shop API & Admin",
+  "description": "Orders, carts & <b>stock</b>.",
+  "java": "21",
+  "xmlns": "http://maven.apache.org/POM/4.0.0"
+}
+' '.project | {name, description, java: .properties["java.version"], xmlns: ."@xmlns"}' "$POM"
+check "xq: one element is an object" 0 $'"object"\n' '.project.build.plugins.plugin | type' "$POM"
+check "xq: --xml-force-list" 0 $'"array"\n' --xml-force-list plugin '.project.build.plugins.plugin | type' "$POM"
+check "xq: YAML output" 0 'plugins:
+  plugin:
+    groupId: org.apache.maven.plugins
+    artifactId: maven-compiler-plugin
+    configuration:
+      "@release": "21"
+' -y '.project.build' "$POM"
+printf '<feed>\n  <entry id="1"/>\n  <entry id="2">two</entry>\n</feed>\n' > "$TMP/feed.xml"
+IN=$TMP/feed.xml check "xq: standard input, slurp" 0 $'[{"feed":{"entry":[{"@id":"1"},{"@id":"2","#text":"two"}]}}]\n' -s -c .
+printf '<a>\n  <b>text</c>\n</a>\n' > "$TMP/bad.xml"
+check_err "xq: not well-formed" 2 "xq: $TMP/bad.xml:2: mismatched closing tag for <b>
+" . "$TMP/bad.xml"
+printf '<a/>\n<b/>\n' > "$TMP/two.xml"
+check_err "xq: two roots" 2 "xq: $TMP/two.xml:2: junk after document element
+" . "$TMP/two.xml"
+check "xq: other files still read" 2 $'"2.4.1"\n' '.project.version' "$TMP/bad.xml" "$POM"
+check "xq: version" 0 $'xq (loup-cmd-yq) 0.1.0\n' --version
+check_err "xq: usage error" 2 "xq: option '--xml-force-list' requires an argument
+Try 'xq --help' for more information.
+" . --xml-force-list
+
+# --- tomlq: TOML input -----------------------------------------------------------
+
+SCRIPT=bin/tomlq.lpscr
+TOML=tests/fixtures/pyproject.toml
+check "tomlq: array" 0 $'httpx>=0.27\npydantic>=2.6,<3\nrich\n' -r '.project.dependencies[]' "$TOML"
+check "tomlq: interpolation" 0 $'shop-client 1.8.0\n' -r '.project | "\(.name) \(.version)"' "$TOML"
+check "tomlq: arrays of tables" 0 $'["rich.*","httpx.*"]\n' -c '[.tool.mypy.overrides[] | .module]' "$TOML"
+check "tomlq: YAML output" 0 'ruff:
+  line-length: 100
+  lint:
+    select:
+      - E
+      - F
+      - I
+mypy:
+  overrides:
+    - module: rich.*
+      ignore_missing_imports: true
+    - module: httpx.*
+      follow_imports: skip
+' -y '.tool' "$TOML"
+printf 'when = 1979-05-27T07:32:00Z\nport = 0x1F90\n' > "$TMP/types.toml"
+check "tomlq: dates and numbers" 0 $'{"when":"1979-05-27T07:32:00Z","port":8080}\n' -c . "$TMP/types.toml"
+printf '[server]\nport = 8080\nport = 8081\n' > "$TMP/bad.toml"
+check_err "tomlq: duplicate key" 2 "tomlq: $TMP/bad.toml:3: duplicate key 'port'
+" . "$TMP/bad.toml"
+check "tomlq: version" 0 $'tomlq (loup-cmd-yq) 0.1.0\n' --version
+run --help
+status=$?
+head -1 "$TMP/out" > "$TMP/got"
+printf 'usage: tomlq [OPTION]... FILTER [FILE]...\n' > "$TMP/want"
+report "tomlq: help" $status 0 "$TMP/want" "$TMP/got"
 
 echo "e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -1,0 +1,24 @@
+#!/usr/bin/env -S loup run
+@mode(host.scripted)
+
+# xq: query XML files with jq filters, as Python's xq does: each file
+# becomes one JSON-like value, which the filter queries.
+#
+# Runtime: host.scripted. An entry point: the Loup scripted runtime
+# interprets this file from source (`loup run bin/xq.lpscr -- ARGS`, as
+# `make run APP=xq`, tests/e2e.sh and CI do; on Linux x86-64 that is the
+# self-hosted driver). Its top-level statements run in order and there is
+# no compile step. `make check` type-checks it, with every lib/ module it
+# imports, using Stage0 (`loup-bootstrap check`). Long options must follow
+# `--` under `loup run`; short ones (`-rc`) pass through.
+#
+# Structure: the command itself is lib/command.lpscr, which yq and tomlq
+# share; xq gives it the XML reader (lib/xmlin.lpscr). It is a program of
+# its own because data.xml cannot be loaded together with data.yaml or
+# data.toml.
+
+from ..lib.appinfo import (InputFormat);
+from ..lib.command import (main);
+from ..lib.xmlin import (read_xml);
+
+exit(main(InputFormat.Xml, args(), read_xml));

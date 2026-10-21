@@ -1,20 +1,41 @@
 @mode(host.dual)
 
-# The text yq prints for --help and --version.
+# The text yq, xq and tomlq print for --help and --version.
 #
-# Runtime: host.dual, but only ever interpreted here: bin/yq.lpscr imports
-# it under `loup run`, and tests/e2e.sh checks its output there. It uses
-# nothing a native build lacks, so it stays compilable.
+# Runtime: host.dual, but only ever interpreted here: lib/command.lpscr
+# imports it under `loup run`, and tests/e2e.sh checks its output there.
+# It uses nothing a native build lacks, so it stays compilable.
 
-from .appinfo import (APP_NAME, APP_VERSION, APP_SUMMARY);
+from .appinfo import (APP_NAME, APP_VERSION, InputFormat, program_name, format_name);
 
-pub func usage(): string {
-    let lines = [
-        i"usage: {$ APP_NAME $} [OPTION]... FILTER [FILE]...",
+# What one input is, for each format.
+func input_lines(format: InputFormat): list[string] {
+    return match format {
+        InputFormat.Yaml => [
+            "FILTER is a jq filter; each YAML document of each FILE is one input",
+            "(standard input when there is no FILE or FILE is -).",
+        ],
+        InputFormat.Xml => [
+            "FILTER is a jq filter; each XML FILE is one input, an object with the",
+            "root element's name as its key: attributes become \"@name\" keys, child",
+            "elements keys of their own (an array when the name repeats) and text",
+            "\"#text\" (standard input when there is no FILE or FILE is -).",
+        ],
+        InputFormat.Toml => [
+            "FILTER is a jq filter; each TOML FILE is one input, its tables as",
+            "objects (standard input when there is no FILE or FILE is -).",
+        ],
+    };
+}
+
+pub func usage(format: InputFormat): string {
+    let name = program_name(format);
+    var lines = [
+        i"usage: {$ name $} [OPTION]... FILTER [FILE]...",
         "",
-        APP_SUMMARY,
-        "FILTER is a jq filter; each YAML document of each FILE is one input",
-        "(standard input when there is no FILE or FILE is -).",
+        i"Query {$ format_name(format) $} with jq filters; print JSON or YAML.",
+    ];
+    lines = lines + input_lines(format) + [
         "",
         "  -y, --yaml-output       write the results as YAML",
         "  -r, --raw-output        write strings without quotes",
@@ -22,11 +43,20 @@ pub func usage(): string {
         "  -c, --compact-output    write each JSON result on one line",
         "      --indent N          indent JSON by N spaces (0 to 7, default 2)",
         "  -S, --sort-keys         sort the keys of every object",
-        "  -s, --slurp             read all documents into one array",
+        "  -s, --slurp             read all inputs into one array",
         "  -n, --null-input        run the filter once, on null, reading nothing",
         "  -e, --exit-status       exit 1 if the last result is false or null,",
         "                          4 if there was none",
         "      --arg NAME VALUE    set $NAME to the string VALUE",
+    ];
+    if (format == InputFormat.Xml) {
+        lines = lines + [
+            "      --xml-force-list NAME",
+            "                          make every NAME element an array, even a",
+            "                          single one (repeat for more names)",
+        ];
+    }
+    lines = lines + [
         "  -h, --help              display this help and exit",
         "  -V, --version           output version information and exit",
         "",
@@ -37,7 +67,7 @@ pub func usage(): string {
         "limit first last split join (README.md lists them all).",
         "",
         "Under `loup run`, long options go after `--`:",
-        i"  loup run bin/{$ APP_NAME $}.lpscr -- --yaml-output '.items[]' app.yaml",
+        i"  loup run bin/{$ name $}.lpscr -- --yaml-output '.items[]' FILE",
         "",
         "Exit status: 0 success, 1 last result false or null (-e), 2 usage error",
         "or unreadable input, 3 filter syntax error, 4 no result (-e), 5 error",
@@ -46,6 +76,7 @@ pub func usage(): string {
     return lines.join("\n");
 }
 
-pub func version_line(): string {
-    return i"{$ APP_NAME $} (loup-cmd-{$ APP_NAME $}) {$ APP_VERSION $}";
+# `xq (loup-cmd-yq) 0.1.0`: the program's name and the package it is in.
+pub func version_line(format: InputFormat): string {
+    return i"{$ program_name(format) $} (loup-cmd-{$ APP_NAME $}) {$ APP_VERSION $}";
 }

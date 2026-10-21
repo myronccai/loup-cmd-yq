@@ -1,15 +1,18 @@
 @mode(host.scripted)
 
-# yq's command line: jq's options (plus -y), a filter and files.
+# The command line of yq, xq and tomlq: jq's options (plus -y), a filter
+# and files; xq also takes --xml-force-list.
 #
-# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
-# with it by `loup run`; the unit tests import it under Stage0's test runner
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted with
+# them by `loup run`; the unit tests import it under Stage0's test runner
 # (`loup-bootstrap test --no-parallel --file`).
 #
-# Grammar: yq [OPTION]... FILTER [FILE]... Short options combine (`-rc`);
-# long options are `--name` (and `--indent N` / `--indent=N`, `--arg NAME
-# VALUE`); options may come anywhere before `--`. The first operand is the
-# filter, the others are files.
+# Grammar: PROGRAM [OPTION]... FILTER [FILE]... Short options combine
+# (`-rc`); long options are `--name` (and `--indent N` / `--indent=N`,
+# `--arg NAME VALUE`, `--xml-force-list NAME`); options may come anywhere
+# before `--`. The first operand is the filter, the others are files.
+
+from .appinfo import (InputFormat);
 
 pub class Options {
     pub var filter: string = "";
@@ -27,6 +30,8 @@ pub class Options {
     # --arg NAME VALUE pairs: the names in order, the values by name.
     pub var arg_names: list[string] = [];
     pub var arg_values: dict[string, Any] = {};
+    # xq: element names whose value is always an array.
+    pub var force_list: list[string] = [];
     pub var help: bool = false;
     pub var version: bool = false;
 }
@@ -82,7 +87,21 @@ pub func parse_indent(text: string): int? {
     return Some(text.toInt());
 }
 
-pub func parse_args(argv: list[string]): Result[Options, string] {
+# The value of the long option `word` (`--name=VALUE`, or `--name` and
+# VALUE in the next argument, argv[i]) and the index of the argument
+# after it.
+func long_value(argv: list[string], i: int, word: string): Result[(string, int), string] {
+    let eq = word.index_of("=");
+    if (eq >= 0) {
+        return Ok((word.slice(eq + 1), i));
+    }
+    if (i < argv.len()) {
+        return Ok((argv[i], i + 1));
+    }
+    return Err("option '" + word + "' requires an argument");
+}
+
+pub func parse_args(argv: list[string], format: InputFormat): Result[Options, string] {
     let o = Options();
     var only_operands = false;
     var i = 0;
@@ -108,15 +127,8 @@ pub func parse_args(argv: list[string]): Result[Options, string] {
             let eq = word.index_of("=");
             let name = if (eq >= 0) { word.slice(2, eq) } else { word.slice(2) };
             if (name == "indent") {
-                var text = "";
-                if (eq >= 0) {
-                    text = word.slice(eq + 1);
-                } else if (i < argv.len()) {
-                    text = argv[i];
-                    i += 1;
-                } else {
-                    return Err("option '--indent' requires an argument");
-                }
+                let (text, next) = long_value(argv, i, word)?;
+                i = next;
                 match parse_indent(text) {
                     Some(n) => {
                         safe {
@@ -141,6 +153,14 @@ pub func parse_args(argv: list[string]): Result[Options, string] {
                         o.arg_names.push(var_name);
                     }
                     o.arg_values[var_name] = value;
+                }
+                continue;
+            }
+            if (name == "xml-force-list" and format == InputFormat.Xml) {
+                let (element, next) = long_value(argv, i, word)?;
+                i = next;
+                safe {
+                    o.force_list.push(element);
                 }
                 continue;
             }

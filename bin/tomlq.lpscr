@@ -1,0 +1,24 @@
+#!/usr/bin/env -S loup run
+@mode(host.scripted)
+
+# tomlq: query TOML files with jq filters, as Python's tomlq does: each
+# file becomes one object, which the filter queries.
+#
+# Runtime: host.scripted. An entry point: the Loup scripted runtime
+# interprets this file from source (`loup run bin/tomlq.lpscr -- ARGS`, as
+# `make run APP=tomlq`, tests/e2e.sh and CI do; on Linux x86-64 that is
+# the self-hosted driver). Its top-level statements run in order and there
+# is no compile step. `make check` type-checks it, with every lib/ module
+# it imports, using Stage0 (`loup-bootstrap check`). Long options must
+# follow `--` under `loup run`; short ones (`-rc`) pass through.
+#
+# Structure: the command itself is lib/command.lpscr, which yq and xq
+# share; tomlq gives it the TOML reader (lib/tomlin.lpscr). It is a
+# program of its own because data.toml cannot be loaded together with
+# data.yaml or data.xml.
+
+from ..lib.appinfo import (InputFormat);
+from ..lib.command import (main);
+from ..lib.tomlin import (read_toml);
+
+exit(main(InputFormat.Toml, args(), read_toml));

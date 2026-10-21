@@ -1,0 +1,44 @@
+@mode(host.scripted)
+
+# Unit tests for tomlq's TOML reading (lib/tomlin.lpscr): tables, arrays
+# of tables, value types and the errors with their lines.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expectEq);
+from ..lib.tomlin import (read_toml);
+from ..lib.values import (InputError, json_text);
+from ..lib.args import (Options);
+
+# The value tomlq reads from `text`, as compact JSON (an error as its
+# message).
+func read(text: string): string {
+    let value = read_toml(text, "t.toml", Options())[0];
+    if (value is InputError) {
+        return "ERROR " + (value as InputError).message;
+    }
+    return json_text(value);
+}
+
+func test_tables(): void {
+    expectEq(read("name = \"demo\"\n[server]\nport = 8080\n[server.tls]\nenabled = false\n"), "{\"name\":\"demo\",\"server\":{\"port\":8080,\"tls\":{\"enabled\":false}}}", "nested tables");
+    expectEq(read("a.b.c = 1\n"), "{\"a\":{\"b\":{\"c\":1}}}", "dotted keys");
+    expectEq(read("[[bin]]\nname = \"x\"\n[[bin]]\nname = \"y\"\npath = 'src/y.rs'\n"), "{\"bin\":[{\"name\":\"x\"},{\"name\":\"y\",\"path\":\"src/y.rs\"}]}", "arrays of tables");
+    expectEq(read("deps = { serde = { version = \"1\", features = [\"derive\"] } }\n"), "{\"deps\":{\"serde\":{\"version\":\"1\",\"features\":[\"derive\"]}}}", "inline tables");
+}
+
+func test_values(): void {
+    expectEq(read("i = 0x1F\nf = 6.5e-1\nb = true\nu = 1_000\n"), "{\"i\":31,\"f\":0.65,\"b\":true,\"u\":1000}", "numbers and booleans");
+    expectEq(read("s = \"tab\\there\"\nl = 'C:\\path'\nm = \"\"\"\nline 1\nline 2\"\"\"\n"), "{\"s\":\"tab\\there\",\"l\":\"C:\\\\path\",\"m\":\"line 1\\nline 2\"}", "strings");
+    expectEq(read("when = 1979-05-27T07:32:00Z\nday = 1979-05-27\n"), "{\"when\":\"1979-05-27T07:32:00Z\",\"day\":\"1979-05-27\"}", "dates as they are written");
+    expectEq(read(""), "{}", "an empty file is an empty table");
+}
+
+func test_errors(): void {
+    expectEq(read("a = 1\n\na = 2\n"), "ERROR t.toml:3: duplicate key 'a'", "duplicate key");
+    expectEq(read("[server\nport = 1\n"), "ERROR t.toml:1: expected ']' after table header, found end of line", "table header");
+    expectEq(read("x = \"open\n"), "ERROR t.toml:1: unterminated string", "string");
+}

@@ -2,8 +2,8 @@
 
 # yq's filter lexer: turns a jq filter into tokens.
 #
-# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
-# with it by `loup run`; the unit tests import it under Stage0's test runner
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted
+# with them by `loup run`; the unit tests import it under Stage0's test runner
 # (`loup-bootstrap test --no-parallel --file`).
 #
 # Structure: tokenize() scans left to right. A string token keeps its body

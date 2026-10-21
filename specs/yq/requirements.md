@@ -10,8 +10,13 @@ one file) and evaluates a substantial subset of the jq language: paths,
 iteration, pipes, construction, operators, conditionals, variables, string
 interpolation and the common builtins.
 
-It is a host-scripted project of the loup-cmd series: the program is
-`bin/yq.lpscr`, run with `loup run`, over modules in `lib/`.
+Like Python's yq, the package has two more programs: `xq` reads XML
+files and `tomlq` TOML files, each file becoming one JSON-like input, with
+the same filters, options and output.
+
+It is a host-scripted project of the loup-cmd series: the programs are
+`bin/yq.lpscr`, `bin/xq.lpscr` and `bin/tomlq.lpscr`, run with `loup run`,
+over modules in `lib/`.
 
 ## Requirements
 
@@ -124,3 +129,48 @@ filter without input.
 2. WITH `-n`, the filter SHALL run once on `null` and no input SHALL be
    read.
 3. `--arg NAME VALUE` SHALL bind `$NAME` to the string VALUE.
+
+### Requirement 6: XML input (xq)
+
+**User Story:** As a developer, I want to query XML files (build files,
+feeds, configuration) with the same filters.
+
+#### Acceptance Criteria
+
+1. `xq` SHALL take yq's command line and options and read each FILE as one
+   XML document with `data.xml`; the input SHALL be an object whose only
+   key is the root element's name.
+2. An element's value SHALL be `null` when it has no attributes, children
+   or text; its text (trimmed) when it has only text; otherwise an object
+   of its attributes (`@name`), its child elements by name (an array when
+   a name repeats, in the order the names first appear) and its trimmed
+   text (`#text`), as Python's xq (xmltodict) gives it.
+3. `--xml-force-list NAME` (repeatable) SHALL make every NAME element an
+   array, even a single one; yq and tomlq SHALL reject the option.
+4. THE reader SHALL decode the predefined entities, character references
+   and CDATA sections, skip comments, processing instructions and the
+   document type declaration, and drop references to entities such a
+   declaration may define.
+5. WHEN a document is not well-formed (mismatched or unclosed tags, an
+   undefined entity, a stray `&`, text or a second element outside the
+   root, an unclosed CDATA section), `xq` SHALL print
+   `xq: FILE:LINE: MESSAGE` with the line in the original file, go on
+   with the other files and exit with status 2.
+
+### Requirement 7: TOML input (tomlq)
+
+**User Story:** As a developer, I want to query TOML files
+(`pyproject.toml`, `Cargo.toml`) with the same filters.
+
+#### Acceptance Criteria
+
+1. `tomlq` SHALL take yq's command line and options and read each FILE as
+   one TOML document with `data.toml`: tables as objects, arrays as
+   arrays, strings, numbers and booleans as themselves, dates and times as
+   strings as written.
+2. WHEN a file is not valid TOML, `tomlq` SHALL print
+   `tomlq: FILE:LINE: MESSAGE`, go on with the other files and exit with
+   status 2.
+3. `--help` and `--version` SHALL name the program (`xq`, `tomlq`), and
+   usage errors SHALL read `PROGRAM: MESSAGE` with
+   `Try 'PROGRAM --help' for more information.`

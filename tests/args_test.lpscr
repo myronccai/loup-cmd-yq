@@ -1,6 +1,6 @@
 @mode(host.scripted)
 
-# Unit tests for yq's command line (lib/args.lpscr).
+# Unit tests for the command line of yq, xq and tomlq (lib/args.lpscr).
 #
 # Runtime: host.scripted, run by the test runner: `make test` interprets
 # this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
@@ -9,13 +9,14 @@
 
 from debug.assert import (expect, expectEq);
 from ..lib.args import (Options, parse_args, parse_indent);
+from ..lib.appinfo import (InputFormat);
 
 func ok(argv: list[string]): Options {
-    return parse_args(argv).unwrap();
+    return parse_args(argv, InputFormat.Yaml).unwrap();
 }
 
 func err(argv: list[string]): string {
-    match parse_args(argv) {
+    match parse_args(argv, InputFormat.Yaml) {
         Ok(o) => {
             return "accepted";
         },
@@ -58,4 +59,13 @@ func test_errors(): void {
     expectEq(err(["--indent", "9", "."]), "--indent takes a number from 0 to 7, not '9'", "indent range");
     expectEq(err(["--arg", "x"]), "--arg takes two parameters (e.g. --arg varname value)", "arg");
     expect(parse_indent("7") == Some(7) and parse_indent("x").is_none(), "parse_indent");
+}
+
+func test_xml_force_list(): void {
+    let o = parse_args(["--xml-force-list", "item", ".", "--xml-force-list=entry", "a.xml"], InputFormat.Xml).unwrap();
+    expectEq(o.force_list.join(","), "item,entry", "both spellings, in order");
+    expectEq(o.files.join(","), "a.xml", "files");
+    expectEq(parse_args(["--xml-force-list"], InputFormat.Xml).unwrap_err(), "option '--xml-force-list' requires an argument", "no name");
+    expectEq(err(["--xml-force-list", "item", "."]), "unrecognized option '--xml-force-list'", "yq has no such option");
+    expectEq(parse_args(["--xml-force-list", "x", "."], InputFormat.Toml).unwrap_err(), "unrecognized option '--xml-force-list'", "nor has tomlq");
 }

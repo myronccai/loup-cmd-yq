@@ -2,8 +2,8 @@
 
 # yq's filter parser: turns the tokens of a jq filter into a Node tree.
 #
-# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
-# with it by `loup run`; the unit tests import it under Stage0's test runner
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted
+# with them by `loup run`; the unit tests import it under Stage0's test runner
 # (`loup-bootstrap test --no-parallel --file`).
 #
 # Structure: recursive descent with one method per precedence level, from

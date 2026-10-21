@@ -3,8 +3,8 @@
 # yq's reader for YAML flow collections (`[a, b]`, `{k: v}`) and plain
 # scalars: the parts of YAML that data.yaml leaves as text.
 #
-# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
-# with it by `loup run`; the unit tests import it under Stage0's test runner
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted
+# with them by `loup run`; the unit tests import it under Stage0's test runner
 # (`loup-bootstrap test --no-parallel --file`).
 #
 # Structure: scalar_value() types a plain scalar with data.yaml's rules, so

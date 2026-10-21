@@ -1,0 +1,101 @@
+@mode(host.scripted)
+
+# Unit tests for xq's XML reading (lib/xmlin.lpscr): the values elements
+# become, --xml-force-list, what the preparer hands data.xml (CDATA,
+# character references, the document type declaration) and the errors
+# with the lines they name.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq, expectThrows);
+from data.xml import (parse, Element);
+from ..lib.xmlin import (XmlPreparer, read_xml, element_value);
+from ..lib.values import (InputError, json_text);
+from ..lib.args import (Options);
+
+# The values xq reads from `text`, as compact JSON (an error as its
+# message).
+func read(text: string): string {
+    return read_with(text, []);
+}
+
+func read_with(text: string, force: list[string]): string {
+    let opts = Options();
+    safe {
+        for (name in force) {
+            opts.force_list.push(name);
+        }
+    }
+    let value = read_xml(text, "t.xml", opts)[0];
+    if (value is InputError) {
+        return "ERROR " + (value as InputError).message;
+    }
+    return json_text(value);
+}
+
+# What the preparer hands data.xml.
+func prepared(text: string): string {
+    let prep = XmlPreparer(text);
+    safe {
+        prep.run();
+    }
+    return prep.text();
+}
+
+func test_elements(): void {
+    expectEq(read("<a/>"), "{\"a\":null}", "an empty element is null");
+    expectEq(read("<a>  text  </a>"), "{\"a\":\"text\"}", "text only: the text, trimmed");
+    expectEq(read("<a id=\"1\" lang='en'/>"), "{\"a\":{\"@id\":\"1\",\"@lang\":\"en\"}}", "attributes as @name");
+    expectEq(read("<a id=\"1\">x</a>"), "{\"a\":{\"@id\":\"1\",\"#text\":\"x\"}}", "attributes and text");
+    expectEq(read("<a><b>1</b><c/><b>2</b></a>"), "{\"a\":{\"b\":[\"1\",\"2\"],\"c\":null}}", "a repeated name is an array, where it first appears");
+    expectEq(read("<p>Hello <b>big</b> world</p>"), "{\"p\":{\"b\":\"big\",\"#text\":\"Hello  world\"}}", "mixed content: the text after the children");
+    expectEq(read("<?xml version=\"1.0\"?>\n<!-- c -->\n<r>\n  <x:i xmlns:x=\"urn:x\">5</x:i>\n</r>\n"), "{\"r\":{\"x:i\":{\"@xmlns:x\":\"urn:x\",\"#text\":\"5\"}}}", "prolog, comments, prefixed names");
+}
+
+func test_force_list(): void {
+    expectEq(read_with("<a><b>1</b></a>", ["b"]), "{\"a\":{\"b\":[\"1\"]}}", "one b, still an array");
+    expectEq(read_with("<a><b>1</b><b>2</b></a>", ["b"]), "{\"a\":{\"b\":[\"1\",\"2\"]}}", "several");
+    expectEq(read_with("<a/>", ["a"]), "{\"a\":[null]}", "the root too");
+}
+
+func test_preparer(): void {
+    expectEq(prepared("<a><![CDATA[x < y && z]]></a>"), "<a>x &lt; y &amp;&amp; z</a>", "CDATA becomes escaped text");
+    expectEq(prepared("<a t=\"&#65;&#x42;\">&#233;&#60;&#38;</a>"), "<a t=\"AB\">é&lt;&amp;</a>", "character references");
+    expectEq(prepared("<!DOCTYPE a [\n<!ENTITY e \"x\">\n]>\n<a>&e;&amp;</a>"), "\n\n\n<a>&amp;</a>", "a DTD is dropped with its entities, its line breaks kept");
+    expectEq(prepared("\u{FEFF}<a/>"), "<a/>", "a byte order mark");
+    expectEq(read("<a>x &amp; &#x1F600; <![CDATA[<b>]]></a>"), "{\"a\":\"x & 😀 <b>\"}", "all of it decoded");
+}
+
+# data.xml's own view of a prepared document: find, findAll, attribute
+# and text.
+func test_data_xml_view(): void {
+    let root: Element = parse(prepared("<feed><entry id=\"&#49;\"><title>One</title></entry><entry id=\"2\"/></feed>"));
+    expectEq(root.findAll("entry").len(), 2, "both entries");
+    let first = root.find("entry").unwrap();
+    expectEq(first.attribute("id").unwrap(), "1", "a reference in an attribute");
+    expectEq(first.find("title").unwrap().text(), "One", "nested text");
+    expectEq(json_text(element_value(first, [])), "{\"@id\":\"1\",\"title\":\"One\"}", "the entry's value");
+    # Nothing is invented: a lookup that finds nothing is None, and
+    # unwrapping it throws.
+    let missing = expectThrows(func(): void { first.attribute("lang").unwrap(); }, "no lang attribute");
+    expect(missing is UnwrapError, "an UnwrapError");
+}
+
+func test_errors(): void {
+    expectEq(read("<a>\n<b></a>"), "ERROR t.xml:2: mismatched closing tag for <b>", "data.xml's error, with its line");
+    expectEq(read("<a>\n\n&nbsp;</a>"), "ERROR t.xml:3: undefined entity &nbsp;", "an undefined entity");
+    expectEq(read("<a>fish & chips</a>"), "ERROR t.xml:1: not well-formed (invalid token)", "a stray &");
+    expectEq(read("<a/>\n<b/>"), "ERROR t.xml:2: junk after document element", "a second root");
+    expectEq(read("<a/>\ntext"), "ERROR t.xml:2: junk after document element", "text after the root");
+    expectEq(read("text <a/>"), "ERROR t.xml:1: syntax error", "text before it");
+    expectEq(read("<a>\n<![CDATA[x\n</a>"), "ERROR t.xml:2: unclosed CDATA section", "an unclosed CDATA section");
+    expectEq(read("<a>&#0;</a>"), "ERROR t.xml:1: reference to invalid character number", "character 0");
+    expectEq(read("<a v=\"1<2\"/>"), "ERROR t.xml:1: not well-formed (invalid token)", "< in an attribute value");
+    expectEq(read("  \n"), "ERROR t.xml:2: no root element", "nothing");
+    # A reference that adds a line break does not move the lines after it.
+    expectEq(read("<a>&#10;&#10;\n<b>\n</a>"), "ERROR t.xml:3: mismatched closing tag for <b>", "lines after &#10;");
+    expectEq(read("<!DOCTYPE a [\n<!ENTITY e \"x\">\n]>\n<a>\n</b>"), "ERROR t.xml:5: mismatched closing tag for <a>", "lines after a DTD");
+}

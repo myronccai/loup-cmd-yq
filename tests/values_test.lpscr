@@ -1,7 +1,8 @@
 @mode(host.scripted)
 
 # Unit tests for yq's value model (lib/values.lpscr): types, truth, jq's
-# order, deep equality, canonical text and the arithmetic operators.
+# order, deep equality, canonical text, compact JSON, rebuilt input values
+# and the arithmetic operators.
 #
 # Runtime: host.scripted, run by the test runner: `make test` interprets
 # this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
@@ -10,7 +11,7 @@
 
 from debug.assert import (expect, expectEq);
 from system.json import (stringify);
-from ..lib.values import (JqError, kind, truthy, compare, equal, canonical, sort_keys, add, subtract, multiply, divide, modulo, number, describe);
+from ..lib.values import (JqError, kind, truthy, compare, equal, canonical, sort_keys, add, subtract, multiply, divide, modulo, number, describe, json_text, plain);
 from ..lib.flow import (parse_flow);
 
 func v(text: string): Any {
@@ -58,6 +59,22 @@ func test_canonical(): void {
     expectEq(stringify(number(4.0)), "4", "whole float");
     expectEq(stringify(number(2.5)), "2.5", "fraction");
     expectEq(describe(v("{key: a long value}")), "object ({\"key\":\"a ...)", "described, cut short");
+}
+
+func test_json_text(): void {
+    let value = v("{b: [1, 2.5, 'it''s', null, true, -0.5e3], a: {}, c: [], \"k k\": {d: [[x]]}}");
+    expectEq(json_text(value), stringify(value), "the text system.json writes");
+    expectEq(json_text(value), "{\"b\":[1,2.5,\"it's\",null,true,-500.0],\"a\":{},\"c\":[],\"k k\":{\"d\":[[\"x\"]]}}", "compact");
+    expectEq(json_text("tab\there \"q\""), "\"tab\\there \\\"q\\\"\"", "escapes");
+}
+
+func test_plain(): void {
+    let items: list[Any] = [1, box "two", box 3.5];
+    let boxed: Any = box items;
+    let rebuilt = plain(boxed);
+    expectEq(json_text(rebuilt), "[1,\"two\",3.5]", "boxed values come back plain");
+    expectEq(stringify(rebuilt), "[1,\"two\",3.5]", "which system.json can write");
+    expect(plain(None) == None, "null");
 }
 
 func test_arithmetic(): void {

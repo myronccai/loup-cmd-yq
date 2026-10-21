@@ -3,8 +3,8 @@
 # yq's builtins: the jq functions a filter can call, from `length` to
 # `group_by(f)`, and the `@csv`-style formats.
 #
-# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
-# with it by `loup run`; the unit tests import it under Stage0's test runner
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted
+# with them by `loup run`; the unit tests import it under Stage0's test runner
 # (`loup-bootstrap test --no-parallel --file`).
 #
 # Structure: BUILTINS lists every name/arity, which the parser checks
@@ -19,8 +19,7 @@
 # run(): the cycle is broken by deferring this import.
 from .eval defer import (run, outputs_of, descend, children, index_value, Env);
 from .ast import (Node);
-from .values import (JqError, Failure, unwrap, kind, truthy, describe, as_array, as_object, to_float, number, compare, equal, canonical, sorted_keys, add);
-from system.json import (stringify);
+from .values import (JqError, Failure, unwrap, kind, truthy, describe, as_array, as_object, to_float, number, compare, equal, canonical, sorted_keys, add, json_text);
 from system.collections import (reduce, any, all, rangeFrom, rangeStep, reverse, flatten, distinctBy, groupBy, toEntries, fromEntries, mapValues, filterKeys, map);
 
 pub let BUILTINS: set[string] = {
@@ -66,7 +65,7 @@ pub func text_of(v: Any): string {
     if (kind(v) == "string") {
         return v as string;
     }
-    return stringify(v);
+    return json_text(v);
 }
 
 func array_input(v: Any, name: string): list[Any] {
@@ -314,7 +313,7 @@ func csv_field(v: Any, tsv: bool): string {
     if (k == "array" or k == "object") {
         throw JqError(describe(v) + " is not valid in a csv row");
     }
-    return stringify(v);
+    return json_text(v);
 }
 
 func sh_word(v: Any): string {
@@ -323,7 +322,7 @@ func sh_word(v: Any): string {
         throw JqError(describe(v) + " can not be escaped for shell");
     }
     if (k != "string") {
-        return stringify(v);
+        return json_text(v);
     }
     return "'" + (v as string).replace("'", "'\\''") + "'";
 }
@@ -428,7 +427,7 @@ func value_of(name: string, input: Any): Any {
         return to_number(input);
     }
     if (name == "tojson" or name == "@json") {
-        return stringify(input);
+        return json_text(input);
     }
     if (name == "ascii_downcase") {
         return string_input(input, name).toLowerCase();
@@ -527,7 +526,7 @@ pub gen func call_builtin(name: string, args: list[Node], input: Any, env: Env):
         } else if (name == "empty") {
             # No output at all.
         } else if (name == "error") {
-            throw JqError(if (kind(input) == "string") { input as string } else { stringify(input) + " (not a string)" });
+            throw JqError(if (kind(input) == "string") { input as string } else { json_text(input) + " (not a string)" });
         } else if (name == "values") {
             if (input != None) {
                 yield input;

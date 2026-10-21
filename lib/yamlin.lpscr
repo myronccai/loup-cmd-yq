@@ -15,17 +15,13 @@
 # a plain value) is read here and replaced by a placeholder word. After
 # data.yaml's parse, normalize() rebuilds the value recursively, putting
 # the cut-out values back; the rebuild also leaves plain values that
-# system.json can write. read_values() ties it together as a generator.
+# system.json can write. read_values() ties it together as a generator,
+# and read_yaml() is yq's reader for lib/command.lpscr.
 
 from data.yaml import (parse, YamlParseError);
 from .flow import (FlowError, parse_flow, scalar_value);
-
-# A file that cannot be read as YAML: `FILE:LINE: message`.
-pub class InputError : Exception {
-    new(message: string) {
-        super(message);
-    }
-}
+from .values import (InputError);
+from .args import (Options);
 
 # One document of a file: its lines and the line number of the first.
 pub struct DocText {
@@ -572,4 +568,14 @@ pub gen func read_values(text: string, name: string): Iterable[Any] {
             }
         }
     }
+}
+
+# yq's reader: the documents of one file, as lib/command.lpscr takes them
+# from each program's reader (the options matter only to xq).
+pub func read_yaml(text: string, name: string, opts: Options): list[Any] {
+    var values: list[Any] = [];
+    for (value in read_values(text, name)) {
+        values.push(value);
+    }
+    return values;
 }

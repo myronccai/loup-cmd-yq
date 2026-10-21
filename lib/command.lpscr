@@ -1,0 +1,174 @@
+@mode(host.scripted)
+
+# The command yq, xq and tomlq share: everything but the reading of a
+# file, which each program's reader does (lib/yamlin.lpscr,
+# lib/xmlin.lpscr, lib/tomlin.lpscr).
+#
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted
+# with them by `loup run`; each script calls main() with its format and
+# reader and exits with the status it returns. It reads files, prints and
+# returns the exit status: the rest of lib/ only computes.
+#
+# Structure: parse the command line (usage errors give status 2), compile
+# the filter (syntax errors give 3) before reading anything, then read the
+# inputs (a generator over the files and the values their reader makes of
+# them) and run the filter on each, printing results as they come. A file
+# that cannot be read, or a filter that fails on one input, is reported
+# and the run goes on; the exit status says what happened. A process runs
+# main() once, so what the run has done so far is kept in module state.
+
+from io.fs import (isDir);
+from .appinfo import (InputFormat, program_name, EXIT_OK, EXIT_FALSE, EXIT_USAGE, EXIT_COMPILE, EXIT_NO_OUTPUT, EXIT_ERROR);
+from .usage import (usage, version_line);
+from .args import (Options, parse_args);
+from .lexer import (FilterSyntaxError);
+from .parser import (compile);
+from .ast import (Node);
+from .eval import (Env, run);
+from .values import (Failure, InputError, truthy);
+from .output import (Style, make_style, render);
+
+# One input value and the file it came from (null for standard input).
+class Input {
+    pub let value: Any;
+    pub let filename: Any;
+
+    new(value: Any, filename: Any) {
+        this.value = value;
+        this.filename = filename;
+    }
+}
+
+# What the run has done so far: the exit status, and the results printed
+# and the last of them (for -e). main() sets them when it starts.
+var status: int = 0;
+var results: int = 0;
+var last: Any = None;
+
+# Every input of the files in order, as Input values; a file that cannot
+# be opened, or a part of one that cannot be read, comes as an InputError
+# value (generators do not throw here: see lib/values.lpscr).
+gen func inputs(files: list[string], read: fn(string, string, Options): list[Any], opts: Options): Iterable[Any] {
+    for (file in files) {
+        let path = if (file == "-") { "/dev/stdin" } else { file };
+        let filename: Any = if (file == "-") { None } else { file };
+        # Checked first: the self-hosted `loup run` cannot catch IoError.
+        if (!exists(path)) {
+            yield InputError(file + ": No such file or directory");
+        } else if (isDir(path)) {
+            yield InputError(file + ": Is a directory");
+        } else {
+            let shown = if (file == "-") { "<stdin>" } else { file };
+            for (value in read(readText(path), shown, opts)) {
+                if (value is InputError) {
+                    yield value;
+                } else {
+                    yield Input(value, filename);
+                }
+            }
+        }
+    }
+}
+
+# Runs the filter on one input, printing results as they come.
+func process(filter: Node, input: Input, opts: Options, style: Style, name: string): void {
+    global status;
+    global results;
+    global last;
+    let env = Env(opts.arg_values, input.filename);
+    for (value in run(filter, input.value, env)) {
+        # An error comes as the last item of the stream, after the results
+        # before it; the next input still runs.
+        if (value is Failure) {
+            printErr(name + ": error: " + (value as Failure).message);
+            status = EXIT_ERROR;
+            break;
+        }
+        if (opts.yaml and results > 0) {
+            println("---");
+        }
+        if (opts.join) {
+            print(render(value, style));
+        } else {
+            println(render(value, style));
+        }
+        results += 1;
+        last = value;
+    }
+}
+
+# Runs the program with the command line `argv`, reading each file with
+# `read`; returns the exit status.
+pub func main(format: InputFormat, argv: list[string], read: fn(string, string, Options): list[Any]): int {
+    global status;
+    global results;
+    global last;
+    status = EXIT_OK;
+    results = 0;
+    last = None;
+    let name = program_name(format);
+    let parsed = parse_args(argv, format);
+    if (parsed.is_err()) {
+        printErr(name + ": " + parsed.unwrap_err());
+        printErr("Try '" + name + " --help' for more information.");
+        return EXIT_USAGE;
+    }
+    let opts: Options = parsed.unwrap();
+    if (opts.help) {
+        println(usage(format));
+        return EXIT_OK;
+    }
+    if (opts.version) {
+        println(version_line(format));
+        return EXIT_OK;
+    }
+
+    # The filter is compiled before any input is read: a syntax error costs
+    # nothing else.
+    var filter: Node = Node.Identity;
+    try {
+        filter = compile(opts.filter, opts.arg_names);
+    } catch (FilterSyntaxError as e) {
+        printErr(name + ": error: " + e.message);
+        printErr(name + ": 1 compile error");
+        return EXIT_COMPILE;
+    }
+
+    # The inputs the filter runs on: null once (-n), every input value in
+    # one array (-s), or each value in turn.
+    var work: list[Input] = [];
+    if (opts.null_input) {
+        work.push(Input(None, None));
+    } else {
+        let files: list[string] = if (opts.files.len() == 0) { ["-"] } else { opts.files };
+        var slurped: list[Any] = [];
+        for (item in inputs(files, read, opts)) {
+            if (item is InputError) {
+                printErr(name + ": " + (item as InputError).message);
+                status = EXIT_USAGE;
+            } else if (opts.slurp) {
+                slurped.push((item as Input).value);
+            } else {
+                work.push(item as Input);
+            }
+        }
+        if (opts.slurp) {
+            work.push(Input(slurped, None));
+        }
+    }
+
+    let style: Style = make_style(opts.yaml, opts.raw, if (opts.compact) { 0 } else { opts.indent }, opts.sort_keys);
+    for (input in work) {
+        process(filter, input, opts, style, name);
+    }
+
+    if (status == EXIT_OK and opts.exit_status) {
+        if (results == 0) {
+            return EXIT_NO_OUTPUT;
+        }
+        if (!truthy(last)) {
+            return EXIT_FALSE;
+        }
+    }
+    return status;
+}

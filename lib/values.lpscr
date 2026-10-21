@@ -4,16 +4,18 @@
 # objects) carried in Loup's Any, with jq's type names, truth, order,
 # equality and arithmetic.
 #
-# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
-# with it by `loup run`; the unit tests import it under Stage0's test runner
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted
+# with them by `loup run`; the unit tests import it under Stage0's test runner
 # (`loup-bootstrap test --no-parallel --file`).
 #
-# Structure: as_array() and as_object() are safe casts (`as?`) and kind()
-# classifies a value by matching its type; everything else recurses over
-# arrays and objects through them: compare() gives jq's total order, which
-# also decides equality, and canonical() a text that equal values share.
+# Structure: the errors (JqError, Failure, InputError); as_array() and
+# as_object(), safe casts (`as?`), and kind(), which classifies a value by
+# matching its type; everything else recurses over arrays and objects
+# through them: plain() rebuilds parsed input, json_text() writes compact
+# JSON, compare() gives jq's total order, which also decides equality, and
+# canonical() a text that equal values share.
 
-from system.json import (stringify);
+from system.json import (stringifyIndented);
 from system.collections import (mergeWith, sortBy);
 
 # A failure while running a filter. bin/yq.lpscr reports it as
@@ -35,6 +37,16 @@ pub class Failure {
 
     new(message: string) {
         this.message = message;
+    }
+}
+
+# A file, or one document of it, that cannot be read: `FILE:LINE:
+# message`. The readers (lib/yamlin.lpscr, lib/xmlin.lpscr,
+# lib/tomlin.lpscr) return it among the values they read, and
+# lib/command.lpscr reports it and goes on with the next input.
+pub class InputError : Exception {
+    new(message: string) {
+        super(message);
     }
 }
 
@@ -113,9 +125,78 @@ pub func to_float(v: Any): float {
     }
 }
 
+# A parsed value rebuilt from plain parts: under Stage0 data.toml and
+# data.yaml hand back boxed values, which system.json cannot write, and
+# new lists and dicts built through typed match arms are plain in both
+# interpreters.
+pub func plain(v: Any): Any {
+    if (v == None) {
+        return None;
+    }
+    match v {
+        string(text) => {
+            return text;
+        },
+        int(n) => {
+            return n;
+        },
+        float(f) => {
+            return f;
+        },
+        bool(b) => {
+            return b;
+        },
+        _ => {},
+    }
+    match as_array(v) {
+        Some(items) => {
+            var out: list[Any] = [];
+            for (item in items) {
+                out.push(plain(item));
+            }
+            return out;
+        },
+        None => {},
+    }
+    let members = v as dict[string, Any];
+    var out: dict[string, Any] = {};
+    for (key in members.keys()) {
+        out[key] = plain(members[key]);
+    }
+    return out;
+}
+
+# A value as compact JSON (jq -c). system.json writes the scalars, but the
+# arrays and objects are written here: data.xml, which xq loads, exports a
+# `stringify` of its own, and in a program that loads it every call to
+# system.json's `stringify` runs data.xml's instead.
+pub func json_text(v: Any): string {
+    match as_array(v) {
+        Some(items) => {
+            var parts: list[string] = [];
+            for (item in items) {
+                parts.push(json_text(item));
+            }
+            return "[" + parts.join(",") + "]";
+        },
+        None => {},
+    }
+    match as_object(v) {
+        Some(members) => {
+            var parts: list[string] = [];
+            for (key in members.keys()) {
+                parts.push(stringifyIndented(key, 0) + ":" + json_text(members[key]));
+            }
+            return "{" + parts.join(",") + "}";
+        },
+        None => {},
+    }
+    return stringifyIndented(v, 0);
+}
+
 # A value in an error message: its type and its JSON, cut short as jq does.
 pub func describe(v: Any): string {
-    var text = stringify(v);
+    var text = json_text(v);
     if (text.len() > 11) {
         text = text.slice(0, 10) + "...";
     }
@@ -241,7 +322,7 @@ pub func sort_keys(v: Any): Any {
 # floats written as integers (1.0 == 1 in jq). Used as a dictionary key
 # when grouping or removing duplicates.
 pub func canonical(v: Any): string {
-    return stringify(canonical_value(sort_keys(v)));
+    return json_text(canonical_value(sort_keys(v)));
 }
 
 func canonical_value(v: Any): Any {

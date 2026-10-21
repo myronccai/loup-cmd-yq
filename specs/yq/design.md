@@ -2,17 +2,30 @@
 
 ## Overview
 
-`bin/yq.lpscr` is a `host.scripted` script and the only code that reads
-files, prints and exits. It parses the command line, compiles the filter
-(before reading anything, so a syntax error costs nothing else), then runs
-the filter on each YAML document of each input and prints the results as
-they come. Everything else is in `lib/`, as `host.scripted` modules (the
-values are `Any`, the streams are generators) plus two `host.dual` modules
-of constants and text.
+Three `host.scripted` entry scripts, `bin/yq.lpscr`, `bin/xq.lpscr` and
+`bin/tomlq.lpscr`, each call `main()` in `lib/command.lpscr` with their
+`InputFormat` and their reader, a function value
+`fn(string, string, Options): list[Any]` that turns a file's text into its
+input values. `lib/command.lpscr` is the only code that reads files,
+prints and decides the exit status. It parses the command line, compiles
+the filter (before reading anything, so a syntax error costs nothing
+else), then runs the filter on each input and prints the results as they
+come. Everything else is in `lib/`, as `host.scripted` modules (the values
+are `Any`, the streams are generators) plus two `host.dual` modules of
+constants and text.
+
+They are three programs, as in Python's yq, because `data.yaml`,
+`data.xml` and `data.toml` each define a private class `_Cursor`: a
+program that imports two of them is refused (E0001, in both
+interpreters), so a single program with an input-format option cannot be
+built. Each reader module imports one of them, and only its script
+imports the reader.
 
 ```text
 FILTER ─ tokenize ─► tokens ─ Parser ─► Node tree (lib/ast.lpscr)
-FILE ─ readText ─► documents() ─ Preparer ─ data.yaml.parse ─ normalize ─► values
+YAML ─ readText ─► documents() ─ Preparer ─ data.yaml.parse ─ normalize ─► values
+XML  ─ readText ─► XmlPreparer ─ data.xml.parse ─ element_value ─► one value
+TOML ─ readText ─► data.toml.parse ─ plain ─► one value
 value ─ run(node, value, env) ─► stream of results ─ render (JSON | raw | YAML) ─► stdout
 ```
 
@@ -20,18 +33,21 @@ value ─ run(node, value, env) ─► stream of results ─ render (JSON | raw 
 
 | Module | Mode | Contents |
 |---|---|---|
-| `bin/yq.lpscr` | scripted | top level: options, compile, inputs generator, output, exit status |
-| `lib/appinfo.loup` | dual | name, version, jq's exit statuses |
-| `lib/usage.loup` | dual | `usage()`, `version_line()` |
-| `lib/args.lpscr` | scripted | `Options`, `parse_args`, `parse_indent` |
+| `bin/yq.lpscr`, `bin/xq.lpscr`, `bin/tomlq.lpscr` | scripted | `exit(main(FORMAT, args(), READER))` |
+| `lib/command.lpscr` | scripted | `main`: options, compile, inputs generator, `process`, exit status |
+| `lib/appinfo.loup` | dual | name, version, `InputFormat`, `program_name`, jq's exit statuses |
+| `lib/usage.loup` | dual | `usage(format)`, `version_line(format)` |
+| `lib/args.lpscr` | scripted | `Options`, `parse_args(argv, format)`, `parse_indent` |
 | `lib/lexer.lpscr` | scripted | `TokKind`, `Token`, `FilterSyntaxError`, `tokenize`, `skip_interpolation` |
 | `lib/ast.lpscr` | scripted | `enum Node` (recursive) |
 | `lib/parser.lpscr` | scripted | `Parser` (recursive descent), `compile`, string decoding |
 | `lib/eval.lpscr` | scripted | `Env`, `gen func run`, `descend`, `children`, `index_value`, `slice_value` |
 | `lib/builtins.lpscr` | scripted | `BUILTINS`, `gen func call_builtin`, sorting, grouping, formats |
-| `lib/values.lpscr` | scripted | `JqError`, `Failure`, `kind`, `truthy`, `compare`, `equal`, `canonical`, arithmetic |
+| `lib/values.lpscr` | scripted | `JqError`, `Failure`, `InputError`, `kind`, `truthy`, `plain`, `json_text`, `compare`, `equal`, `canonical`, arithmetic |
 | `lib/flow.lpscr` | scripted | `scalar_value`, `parse_flow` (`FlowReader`) |
-| `lib/yamlin.lpscr` | scripted | `documents`, `Preparer`, `normalize`, `read_values` |
+| `lib/yamlin.lpscr` | scripted | `documents`, `Preparer`, `normalize`, `read_values`, `read_yaml` |
+| `lib/xmlin.lpscr` | scripted | `XmlPreparer`, `element_value`, `document_value`, `read_xml` |
+| `lib/tomlin.lpscr` | scripted | `read_toml` |
 | `lib/output.lpscr` | scripted | `Style`, `render`, `to_yaml` |
 
 ### Filters
@@ -90,14 +106,53 @@ and leaving plain values that `system.json` can write. An unreadable
 document comes out of `read_values()` as an `InputError` value, with the
 line of the original file, and the documents around it still read.
 
+### XML input
+
+`data.xml` parses elements, attributes, text, comments and processing
+instructions, decoding the five predefined entities. `XmlPreparer` goes
+over the text once, character by character (line endings made `\n`
+first), and writes what data.xml reads: a CDATA section becomes its text
+with `<`, `&` and `>` escaped; a character reference becomes its character
+(or a predefined entity when that is markup); the document type
+declaration, internal subset included, is dropped; a byte order mark is
+skipped. It counts open elements, so it also rejects what data.xml lets
+through: text before the root, a second root element or text after it
+(`junk after document element`), an undefined entity (unless a document
+type declaration may define it: then the reference is dropped, as Python's
+xq does), a stray `&`, `<` in an attribute value and an unclosed CDATA
+section. Its errors are `XmlParseError`s positioned in the prepared text,
+like data.xml's; the preparer keeps the original line of every prepared
+line (a `&#10;` adds a line, a dropped declaration keeps its line
+breaks), so `read_xml()` reports both kinds as `FILE:LINE: message`.
+
+`element_value()` gives xmltodict's mapping: attributes first (`@name`),
+then each child name where it first appears, with every child of that name
+(`findAll`): one value, or an array when there are several or the name is
+in `--xml-force-list`; then the element's text (`text()`, its direct text
+pieces joined, trimmed) as `#text`. An element with nothing but text is
+that text, one with nothing at all `null`. `document_value()` puts the root
+under its name.
+
+### TOML input
+
+`read_toml()` parses with `data.toml` and rebuilds the result with
+`plain()` (Stage0 hands back boxed values); a `TomlParseError` becomes an
+`InputError` with the file name and the error's line.
+
 ### Output
 
 `render()` writes JSON with `system.json.stringifyIndented` (or
-`stringify` for `-c` and `--indent 0`), a raw string for `-r`/`-j`, or YAML
+`json_text()` for `-c` and `--indent 0`), a raw string for `-r`/`-j`, or YAML
 from `to_yaml()`, which recurses over the value: mappings as `key: value`,
 sequences as `- item` (an item's first line shares the dash), multi-line
 strings as `|` blocks, and strings quoted with JSON escapes when YAML would
 not read them back unchanged. `-S` sorts keys first.
+
+`json_text()` writes compact JSON (also for `tojson`, `@json`, `@text`,
+error messages and canonical keys) by recursing over arrays and objects
+and letting `stringifyIndented(v, 0)` write each scalar: `data.xml` exports
+a `stringify` of its own, and in a program that loads it (xq) every call
+to `system.json`'s `stringify` runs data.xml's instead.
 
 ## Differences from the original
 
@@ -112,19 +167,31 @@ not read them back unchanged. `-S` sorts keys first.
   wrapping, differ); there is no `-Y` round trip, `--width` or
   `--indentless`.
 - Error messages start with `yq: error:` (jq's start with `jq: error (at
-  FILE:N):`); YAML errors give the file and line.
+  FILE:N):`); YAML, XML and TOML errors give the file and line, and the
+  other files are still read.
+- xq has no `-x`, `--xml-item-depth`, `--xml-dtd` or `--xml-root`; tomlq no
+  `-t`. There is no input-format option: one program per format (see
+  Overview).
+- XML attribute values keep their whitespace as written; a DTD's entities
+  are dropped, never expanded; only UTF-8 is read. data.xml's time grows
+  with the square of the document's size.
+- TOML dates and times keep their TOML spelling (Python's tomlq writes
+  `isoformat()`); integers beyond 64 bits do not read correctly.
 - `from_entries` also accepts `k`/`v` and `name` keys (jq 1.6/1.7); `ltrimstr`
   and `rtrimstr` leave non-strings unchanged (jq 1.7).
 
 ## Error handling
+
+Messages start with the program's name (`yq`, `xq`, `tomlq`).
 
 - Usage errors: `yq: MESSAGE` and the `Try` hint, status 2.
 - Filter syntax errors: `yq: error: MESSAGE` and `yq: 1 compile error`,
   status 3, before any input is read.
 - Inputs: a missing file or a directory is reported (`exists`/`isDir` are
   checked first: the self-hosted `loup run` cannot catch `IoError`), an
-  unreadable YAML document is reported with its line; the rest is still
-  read and the status is 2.
+  unreadable YAML document, XML or TOML file is reported with its line
+  (each reader returns an `InputError` value); the rest is still read and
+  the status is 2.
 - Filter errors: the results before the error are printed, then
   `yq: error: MESSAGE`; the next input is still processed; status 5.
 - `-e`: 1 when the last result is false or null, 4 when there was none.
@@ -136,10 +203,15 @@ not read them back unchanged. `-S` sorts keys first.
 - `tests/parser_test.lpscr`: tokens, escapes and interpolation, precedence,
   syntax errors.
 - `tests/values_test.lpscr`: types, order, equality, canonical text,
-  arithmetic and its errors.
+  `json_text` against `system.json`, `plain`, arithmetic and its errors.
 - `tests/yamlin_test.lpscr`: documents, block structure, scalars, block
   scalars, flow collections, error lines.
-- `tests/output_test.lpscr`, `tests/args_test.lpscr`.
-- `tests/e2e.sh`: the script under `loup run` on
-  `tests/fixtures/services.yaml`: output forms, filters, inputs, errors and
-  exit statuses.
+- `tests/xmlin_test.lpscr`: element values, `--xml-force-list`, the
+  preparer's output, data.xml's view (`find`, `findAll`, `attribute`,
+  `text`), errors and their lines.
+- `tests/tomlin_test.lpscr`: tables, values, errors.
+- `tests/output_test.lpscr`, `tests/args_test.lpscr` (with
+  `--xml-force-list` for xq only).
+- `tests/e2e.sh`: the scripts under `loup run` on
+  `tests/fixtures/services.yaml`, `pom.xml` and `pyproject.toml`: output
+  forms, filters, inputs, errors and exit statuses.

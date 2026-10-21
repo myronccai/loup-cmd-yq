@@ -1,0 +1,32 @@
+@mode(host.scripted)
+
+# tomlq's TOML reader: data.toml parses a file into nested tables, which
+# come out as one JSON-like object per file.
+#
+# Runtime: host.scripted. A module of the script bin/tomlq.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under
+# Stage0's test runner (`loup-bootstrap test --no-parallel --file`). Only
+# tomlq imports it: a program may load just one of data.toml, data.yaml
+# and data.xml.
+
+from data.toml import (parse, TomlParseError);
+from .values import (InputError, plain);
+from .args import (Options);
+
+# data.toml's message without its `TOML parse error (line N): ` lead,
+# which the report replaces with the file name and line.
+func reason(e: TomlParseError): string {
+    let at = e.message.index_of("): ");
+    return if (at >= 0) { e.message.slice(at + 3) } else { e.message };
+}
+
+# tomlq's reader: a TOML file is one input, its tables objects, its arrays
+# arrays; dates and times keep their TOML spelling as strings. A file that
+# does not parse gives its InputError instead.
+pub func read_toml(text: string, name: string, opts: Options): list[Any] {
+    try {
+        return [plain(parse(text))];
+    } catch (TomlParseError as e) {
+        return [InputError(name + ":" + str(e.line) + ": " + reason(e))];
+    }
+}

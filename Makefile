@@ -1,8 +1,9 @@
 # Check, test and run commands for this host-scripted Loup project.
 #
-# The program is a script (bin/yq.lpscr) that `loup run` executes from
-# source. A script entry cannot be compiled (E-BUILD-COMPILED), so there is
-# no build target. On Linux x86-64 `loup` is the self-hosted driver and
+# The programs are scripts that `loup run` executes from source: yq
+# (bin/yq.lpscr, YAML input), xq (bin/xq.lpscr, XML) and tomlq
+# (bin/tomlq.lpscr, TOML), over the modules in lib/. A script entry cannot
+# be compiled (E-BUILD-COMPILED), so there is no build target. On Linux x86-64 `loup` is the self-hosted driver and
 # `loup-bootstrap` is Stage0; `check` and `test` need Stage0 there. On macOS,
 # Windows and Linux arm64 both names run Stage0, so the targets work unchanged.
 
@@ -18,12 +19,14 @@ TEST_ARGS      ?=
 
 all: ci
 
-# Run from source, e.g. `make run ARGS="-c .services[0] tests/fixtures/services.yaml"`.
+# Run from source, e.g. `make run ARGS="-c .services[0] tests/fixtures/services.yaml"`
+# or `make run APP=xq ARGS="-c .project.version tests/fixtures/pom.xml"`.
 # The arguments follow `--` so that long options reach the script.
 run:
 	$(LOUP) run bin/$(APP).lpscr -- $(ARGS)
 
-# Type-check each entry script and every lib/ module it imports.
+# Type-check each entry script and every lib/ module it imports (data.xml
+# itself prints a W0602 warning for xq).
 check:
 	@for script in $(SCRIPTS); do \
 		echo "check $$script"; \
@@ -41,14 +44,16 @@ test:
 		$(LOUP_BOOTSTRAP) test --no-color --no-parallel --file $$t $(TEST_ARGS) || status=1; \
 	done; exit $$status
 
-# End-to-end tests: run the script with `loup run` and compare its output,
-# standard error and exit status with the expected ones.
+# End-to-end tests: run the scripts with `loup run` and compare their
+# output, standard error and exit status with the expected ones.
 e2e:
 	bash tests/e2e.sh $(LOUP)
 
-# Everything CI runs, ending with a smoke test of the entry script.
+# Everything CI runs, ending with a smoke test of each entry script.
 ci: check test e2e
-	$(LOUP) run bin/$(APP).lpscr -- --version
+	@for script in $(SCRIPTS); do \
+		$(LOUP) run $$script -- --version || exit 1; \
+	done
 
 clean:
 	rm -rf build .temp

@@ -11,7 +11,8 @@
 
 from debug.assert import (expect, expectEq);
 from system.json import (stringify);
-from ..lib.yamlin import (InputError, read_values, documents, mapping_colon);
+from ..lib.yamlin import (read_values, documents, mapping_colon);
+from ..lib.values import (InputError);
 from ..lib.flow import (parse_flow, scalar_value);
 
 # Every document of `text` as compact JSON (an unreadable one as its error).

@@ -1,9 +1,10 @@
 @mode(host.scripted)
 
-# yq's output: a result as JSON (system.json), as raw text, or as YAML.
+# yq's output: a result as JSON (system.json, and json_text() for the
+# compact form), as raw text, or as YAML.
 #
-# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
-# with it by `loup run`; the unit tests import it under Stage0's test runner
+# Runtime: host.scripted. A module of the scripts in bin/, interpreted
+# with them by `loup run`; the unit tests import it under Stage0's test runner
 # (`loup-bootstrap test --no-parallel --file`).
 #
 # Structure: render() picks the form. The YAML writer recurses over the
@@ -13,8 +14,8 @@
 # written plain when YAML would read them back as the same string, quoted
 # otherwise, and multi-line strings as `|` blocks.
 
-from system.json import (stringify, stringifyIndented);
-from .values import (kind, as_array, as_object, sort_keys);
+from system.json import (stringifyIndented);
+from .values import (kind, as_array, as_object, sort_keys, json_text);
 from .flow import (scalar_value);
 
 pub struct Style {
@@ -38,7 +39,7 @@ pub func render(value: Any, style: Style): string {
         return to_yaml(v);
     }
     if (style.indent == 0) {
-        return stringify(v);
+        return json_text(v);
     }
     return stringifyIndented(v, style.indent);
 }
@@ -62,9 +63,9 @@ func plain_safe(text: string): bool {
 func scalar_text(v: Any): string {
     if (kind(v) == "string") {
         let text = v as string;
-        return if (plain_safe(text)) { text } else { stringify(text) };
+        return if (plain_safe(text)) { text } else { json_text(text) };
     }
-    return stringify(v);
+    return json_text(v);
 }
 
 # A multi-line string as a literal block: the header and its lines.

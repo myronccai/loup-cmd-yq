@@ -20,3 +20,11 @@
   - _Requirements: 5.1, 5.2, 5.3_
 - [x] 10. Unit tests, fixture, end-to-end tests with `loup run`
   - _Requirements: all_
+- [x] 11. One command for three programs: `lib/command.lpscr`, `InputFormat`, a reader per format, `bin/xq.lpscr` and `bin/tomlq.lpscr`; compact JSON written by yq (`json_text`)
+  - _Requirements: 6.1, 7.1, 7.3_
+- [x] 12. XML reader: preparer (CDATA, character references, DTD, well-formedness, line map), xmltodict's mapping, `--xml-force-list`
+  - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5_
+- [x] 13. TOML reader over data.toml, with error lines
+  - _Requirements: 7.1, 7.2_
+- [x] 14. Unit tests (`tests/xmlin_test.lpscr`, `tests/tomlin_test.lpscr`), fixtures `pom.xml` and `pyproject.toml`, end-to-end cases for xq and tomlq
+  - _Requirements: 6, 7_
