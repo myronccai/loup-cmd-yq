@@ -1,0 +1,744 @@
+@mode(host.scripted)
+
+# yq's builtins: the jq functions a filter can call, from `length` to
+# `group_by(f)`, and the `@csv`-style formats.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: BUILTINS lists every name/arity, which the parser checks
+# calls against. call_builtin() is a generator like run(): builtins without
+# arguments that give exactly one result go through value_of(); those
+# whose argument is a value (`has("a")`) run once per value of it; the rest
+# run their filter arguments themselves. Sorting and grouping use jq's
+# order from lib/values.lpscr; the list and dict work goes through
+# system.collections.
+
+# eval.lpscr calls call_builtin, and builtins run filters through eval's
+# run(): the cycle is broken by deferring this import.
+from .eval defer import (run, outputs_of, descend, children, index_value, Env);
+from .ast import (Node);
+from .values import (JqError, Failure, unwrap, kind, truthy, describe, as_array, as_object, to_float, number, compare, equal, canonical, sorted_keys, add);
+from system.json import (stringify);
+from system.collections import (reduce, any, all, rangeFrom, rangeStep, reverse, flatten, distinctBy, groupBy, toEntries, fromEntries, mapValues, filterKeys, map);
+
+pub let BUILTINS: set[string] = {
+    "empty/0", "error/0", "error/1", "not/0", "length/0", "keys/0", "keys_unsorted/0",
+    "values/0", "has/1", "type/0", "add/0", "any/0", "all/0", "any/1", "all/1",
+    "map/1", "map_values/1", "select/1", "recurse/0", "to_entries/0", "from_entries/0",
+    "with_entries/1", "sort/0", "sort_by/1", "group_by/1", "unique/0", "unique_by/1",
+    "min/0", "max/0", "min_by/1", "max_by/1", "reverse/0", "flatten/0", "flatten/1",
+    "range/1", "range/2", "range/3", "first/0", "last/0", "first/1", "limit/2",
+    "tostring/0", "tonumber/0", "tojson/0", "ascii_downcase/0", "ascii_upcase/0",
+    "ltrimstr/1", "rtrimstr/1", "startswith/1", "endswith/1", "split/1", "join/1",
+    "contains/1", "input_filename/0", "paths/0",
+    "numbers/0", "strings/0", "booleans/0", "nulls/0", "arrays/0", "objects/0", "iterables/0", "scalars/0",
+    "@text/0", "@json/0", "@csv/0", "@tsv/0", "@sh/0",
+};
+
+# Builtins without arguments that turn one input into exactly one output.
+let SINGLE: set[string] = {
+    "not", "length", "keys", "keys_unsorted", "type", "add", "any", "all", "to_entries",
+    "from_entries", "sort", "unique", "min", "max", "reverse", "flatten", "first", "last",
+    "tostring", "tonumber", "tojson", "ascii_downcase", "ascii_upcase",
+    "@text", "@json", "@csv", "@tsv", "@sh",
+};
+
+# The type selectors (`.. | numbers`) and the kinds each one lets through.
+let SELECTORS: dict[string, list[string]] = {
+    "numbers": ["number"],
+    "strings": ["string"],
+    "booleans": ["boolean"],
+    "nulls": ["null"],
+    "arrays": ["array"],
+    "objects": ["object"],
+    "iterables": ["array", "object"],
+    "scalars": ["null", "boolean", "number", "string"],
+};
+
+# Builtins with one argument used as a value.
+let VALUED: set[string] = {"has", "ltrimstr", "rtrimstr", "startswith", "endswith", "split", "join", "contains", "flatten", "error"};
+
+# How a value reads inside a string (`tostring`, interpolation): strings as
+# they are, everything else as JSON.
+pub func text_of(v: Any): string {
+    if (kind(v) == "string") {
+        return v as string;
+    }
+    return stringify(v);
+}
+
+func array_input(v: Any, name: string): list[Any] {
+    match as_array(v) {
+        Some(items) => {
+            return items;
+        },
+        None => {
+            throw JqError(describe(v) + " cannot be used with " + name + ": it is not an array");
+        },
+    }
+}
+
+func string_input(v: Any, name: string): string {
+    if (kind(v) != "string") {
+        throw JqError(name + " needs a string, not " + describe(v));
+    }
+    return v as string;
+}
+
+# The order of `keys` under jq's sort: a stable sort of positions.
+func order(keys: list[Any]): list[int] {
+    var positions: list[int] = [];
+    for (k in 0..keys.len()) {
+        positions.push(k);
+    }
+    positions.sort(func(a: int, b: int): int {
+        let c = compare(keys[a], keys[b]);
+        return if (c != 0) { c } else { a - b };
+    });
+    return positions;
+}
+
+func sorted(items: list[Any]): list[Any] {
+    var out: list[Any] = [];
+    for (k in order(items)) {
+        out.push(items[k]);
+    }
+    return out;
+}
+
+# The key a `_by` builtin sorts on: all the outputs of `f`, as an array.
+func keys_by(items: list[Any], f: Node, env: Env): list[Any] {
+    var keys: list[Any] = [];
+    for (item in items) {
+        keys.push(outputs_of(f, item, env));
+    }
+    return keys;
+}
+
+func sort_by(items: list[Any], f: Node, env: Env): list[Any] {
+    let keys = keys_by(items, f, env);
+    var out: list[Any] = [];
+    for (k in order(keys)) {
+        out.push(items[k]);
+    }
+    return out;
+}
+
+# Groups of equal keys, in key order: groupBy collects them under the
+# canonical text of the key, and the groups are then ordered by the keys.
+func group_by(items: list[Any], f: Node, env: Env): list[Any] {
+    let keys = keys_by(items, f, env);
+    var positions: list[int] = [];
+    for (k in 0..items.len()) {
+        positions.push(k);
+    }
+    let groups = groupBy(positions, func(k: int): string { return canonical(keys[k]); });
+    var firsts: list[Any] = [];
+    var members: list[list[int]] = [];
+    for (text in groups.keys()) {
+        let group = groups[text];
+        firsts.push(keys[group[0]]);
+        members.push(group);
+    }
+    var out: list[Any] = [];
+    for (g in order(firsts)) {
+        var group: list[Any] = [];
+        for (k in members[g]) {
+            group.push(items[k]);
+        }
+        out.push(group);
+    }
+    return out;
+}
+
+# The smallest (or largest) item by `keys`; null for an empty array.
+func extreme(items: list[Any], keys: list[Any], largest: bool): Any {
+    if (items.len() == 0) {
+        return None;
+    }
+    var best = 0;
+    for (k in 1..items.len()) {
+        let c = compare(keys[k], keys[best]);
+        if ((largest and c >= 0) or (!largest and c < 0)) {
+            best = k;
+        }
+    }
+    return items[best];
+}
+
+func flatten_to(items: list[Any], depth: int): list[Any] {
+    if (depth <= 0) {
+        return items;
+    }
+    var nested: list[list[Any]] = [];
+    for (item in items) {
+        match as_array(item) {
+            Some(inner) => {
+                nested.push(flatten_to(inner, depth - 1));
+            },
+            None => {
+                nested.push([item]);
+            },
+        }
+    }
+    return flatten(nested);
+}
+
+func length_of(v: Any): Any {
+    let k = kind(v);
+    if (k == "null") {
+        return 0;
+    }
+    if (k == "number") {
+        let f = to_float(v);
+        return number(if (f < 0.0) { 0.0 - f } else { f });
+    }
+    if (k == "string") {
+        return (v as string).len();
+    }
+    if (k == "array") {
+        return as_array(v)!.len();
+    }
+    if (k == "object") {
+        return as_object(v)!.len();
+    }
+    throw JqError(describe(v) + " has no length");
+}
+
+func keys_of(v: Any, sort: bool): Any {
+    match as_object(v) {
+        Some(d) => {
+            var names: list[string] = [];
+            if (sort) {
+                names = sorted_keys(d);
+            } else {
+                for (key in d.keys()) {
+                    names.push(key);
+                }
+            }
+            return map(names, func(name: string): Any { return name; });
+        },
+        None => {},
+    }
+    match as_array(v) {
+        Some(items) => {
+            return map(rangeFrom(0, items.len()), func(k: int): Any { return k; });
+        },
+        None => {
+            throw JqError(describe(v) + " has no keys");
+        },
+    }
+}
+
+func entries_of(v: Any): list[Any] {
+    match as_object(v) {
+        Some(d) => {
+            var out: list[Any] = [];
+            for (pair in toEntries(d)) {
+                var entry: dict[string, Any] = {};
+                entry["key"] = pair.0;
+                entry["value"] = pair.1;
+                out.push(entry);
+            }
+            return out;
+        },
+        None => {
+            throw JqError(describe(v) + " has no keys");
+        },
+    }
+}
+
+# from_entries accepts key/k/name and value/v, as jq does.
+func object_of(entries: list[Any]): Any {
+    var pairs: list[(string, Any)] = [];
+    for (entry in entries) {
+        let d = as_object(entry) ?? {};
+        var key: Any = None;
+        for (name in ["key", "k", "name", "Name", "Key", "K"]) {
+            if (key == None and d.containsKey(name)) {
+                key = d[name];
+            }
+        }
+        var value: Any = None;
+        for (name in ["value", "v", "Value", "V"]) {
+            if (value == None and d.containsKey(name)) {
+                value = d[name];
+            }
+        }
+        if (key == None or kind(key) == "array" or kind(key) == "object") {
+            throw JqError("Cannot use " + describe(key) + " as object key");
+        }
+        pairs.push((text_of(key), value));
+    }
+    let made: dict[string, Any] = fromEntries(pairs);
+    return made;
+}
+
+func to_number(v: Any): Any {
+    if (kind(v) == "number") {
+        return v;
+    }
+    let text = string_input(v, "tonumber").trim();
+    var digits = 0;
+    var valid = text != "";
+    for (c in text) {
+        if (c >= "0" and c <= "9") {
+            digits += 1;
+        } else if (!"+-.eE".contains(c)) {
+            valid = false;
+        }
+    }
+    if (!valid or digits == 0) {
+        throw JqError("Cannot parse '" + text + "' as a number");
+    }
+    if (text.contains(".") or text.contains("e") or text.contains("E")) {
+        return text.toFloat();
+    }
+    return text.toInt();
+}
+
+func csv_field(v: Any, tsv: bool): string {
+    let k = kind(v);
+    if (k == "null") {
+        return "";
+    }
+    if (k == "string") {
+        let text = v as string;
+        if (tsv) {
+            return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r");
+        }
+        return "\"" + text.replace("\"", "\"\"") + "\"";
+    }
+    if (k == "array" or k == "object") {
+        throw JqError(describe(v) + " is not valid in a csv row");
+    }
+    return stringify(v);
+}
+
+func sh_word(v: Any): string {
+    let k = kind(v);
+    if (k == "array" or k == "object") {
+        throw JqError(describe(v) + " can not be escaped for shell");
+    }
+    if (k != "string") {
+        return stringify(v);
+    }
+    return "'" + (v as string).replace("'", "'\\''") + "'";
+}
+
+# Whether `b` is contained in `a`: substrings, every element of an array
+# inside some element, every member of an object inside the same member.
+func contains_value(a: Any, b: Any): bool {
+    let ka = kind(a);
+    if (ka != kind(b)) {
+        throw JqError(describe(a) + " and " + describe(b) + " cannot have their containment checked");
+    }
+    if (ka == "string") {
+        return (a as string).contains(b as string);
+    }
+    if (ka == "array") {
+        let haystack = as_array(a)!;
+        return all(as_array(b)!, func(needle: Any): bool {
+            return any(haystack, func(item: Any): bool { return kind(item) == kind(needle) and contains_value(item, needle); });
+        });
+    }
+    if (ka == "object") {
+        let x = as_object(a)!;
+        let y = as_object(b)!;
+        for (key in y.keys()) {
+            if (!x.containsKey(key) or kind(x[key]) != kind(y[key]) or !contains_value(x[key], y[key])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return equal(a, b);
+}
+
+# The builtins without arguments that give one output.
+func value_of(name: string, input: Any): Any {
+    if (name == "not") {
+        return !truthy(input);
+    }
+    if (name == "length") {
+        return length_of(input);
+    }
+    if (name == "keys" or name == "keys_unsorted") {
+        return keys_of(input, name == "keys");
+    }
+    if (name == "type") {
+        return kind(input);
+    }
+    if (name == "add") {
+        let none: Any = None;
+        let items = if (kind(input) == "object") { entries_values(input) } else { array_input(input, "add") };
+        return reduce(items, none, func(total: Any, item: Any): Any { return add(total, item); });
+    }
+    if (name == "any") {
+        return any(array_input(input, "any"), func(item: Any): bool { return truthy(item); });
+    }
+    if (name == "all") {
+        return all(array_input(input, "all"), func(item: Any): bool { return truthy(item); });
+    }
+    if (name == "to_entries") {
+        return entries_of(input);
+    }
+    if (name == "from_entries") {
+        return object_of(array_input(input, "from_entries"));
+    }
+    if (name == "sort") {
+        return sorted(array_input(input, "sort"));
+    }
+    if (name == "unique") {
+        return distinctBy(sorted(array_input(input, "unique")), func(item: Any): string { return canonical(item); });
+    }
+    if (name == "min" or name == "max") {
+        let items = array_input(input, name);
+        return extreme(items, items, name == "max");
+    }
+    if (name == "reverse") {
+        if (input == None) {
+            let none: list[Any] = [];
+            return none;
+        }
+        if (kind(input) == "string") {
+            var out = "";
+            for (c in input as string) {
+                out = c + out;
+            }
+            return out;
+        }
+        return reverse(array_input(input, "reverse"));
+    }
+    if (name == "flatten") {
+        return flatten_to(array_input(input, "flatten"), 1000000);
+    }
+    if (name == "first") {
+        return index_value(input, 0);
+    }
+    if (name == "last") {
+        return index_value(input, -1);
+    }
+    if (name == "tostring" or name == "@text") {
+        return text_of(input);
+    }
+    if (name == "tonumber") {
+        return to_number(input);
+    }
+    if (name == "tojson" or name == "@json") {
+        return stringify(input);
+    }
+    if (name == "ascii_downcase") {
+        return string_input(input, name).toLowerCase();
+    }
+    if (name == "ascii_upcase") {
+        return string_input(input, name).toUpperCase();
+    }
+    if (name == "@csv" or name == "@tsv") {
+        let tsv = name == "@tsv";
+        let fields = map(array_input(input, name), func(item: Any): string { return csv_field(item, tsv); });
+        return fields.join(if (tsv) { "\t" } else { "," });
+    }
+    let words = match as_array(input) {
+        Some(items) => map(items, func(item: Any): string { return sh_word(item); }),
+        None => [sh_word(input)],
+    };
+    return words.join(" ");
+}
+
+func entries_values(v: Any): list[Any] {
+    return children(v);
+}
+
+# The builtins with one argument used as a value.
+func with_value(name: string, input: Any, arg: Any): Any {
+    if (name == "has") {
+        match as_object(input) {
+            Some(d) => {
+                return d.containsKey(string_input(arg, "has"));
+            },
+            None => {
+                let k = to_float(arg) as int;
+                return k >= 0 and k < array_input(input, "has").len();
+            },
+        }
+    }
+    if (name == "ltrimstr" or name == "rtrimstr") {
+        if (kind(input) != "string" or kind(arg) != "string") {
+            return input;
+        }
+        let text = input as string;
+        let cut = arg as string;
+        if (name == "ltrimstr" and text.startsWith(cut)) {
+            return text.slice(cut.len());
+        }
+        if (name == "rtrimstr" and text.endsWith(cut) and cut != "") {
+            return text.slice(0, text.len() - cut.len());
+        }
+        return text;
+    }
+    if (name == "startswith") {
+        return string_input(input, name).startsWith(string_input(arg, name));
+    }
+    if (name == "endswith") {
+        return string_input(input, name).endsWith(string_input(arg, name));
+    }
+    if (name == "split") {
+        return map(string_input(input, name).split(string_input(arg, name)), func(part: string): Any { return part; });
+    }
+    if (name == "join") {
+        let sep = string_input(arg, name);
+        let parts = map(array_input(input, name), func(item: Any): string {
+            if (item == None) {
+                return "";
+            }
+            if (kind(item) == "array" or kind(item) == "object") {
+                throw JqError("Cannot join with " + describe(item));
+            }
+            return text_of(item);
+        });
+        return parts.join(sep);
+    }
+    if (name == "contains") {
+        return contains_value(input, arg);
+    }
+    if (name == "flatten") {
+        let depth = to_float(arg) as int;
+        if (depth < 0) {
+            throw JqError("flatten depth must not be negative");
+        }
+        return flatten_to(array_input(input, name), depth);
+    }
+    # error(message)
+    throw JqError(text_of(arg));
+}
+
+pub gen func call_builtin(name: string, args: list[Node], input: Any, env: Env): Iterable[Any] {
+    try {
+        if (args.len() == 0 and SINGLE.contains(name)) {
+            yield value_of(name, input);
+        } else if (args.len() == 1 and VALUED.contains(name)) {
+            for (each_arg in run(args[0], input, env)) {
+                let arg = unwrap(each_arg);
+                yield with_value(name, input, arg);
+            }
+        } else if (name == "empty") {
+            # No output at all.
+        } else if (name == "error") {
+            throw JqError(if (kind(input) == "string") { input as string } else { stringify(input) + " (not a string)" });
+        } else if (name == "values") {
+            if (input != None) {
+                yield input;
+            }
+        } else if (name == "recurse") {
+            for (each_value in descend(input)) {
+                let value = unwrap(each_value);
+                yield value;
+            }
+        } else if (SELECTORS.containsKey(name)) {
+            let wanted = SELECTORS[name];
+            let k = kind(input);
+            if (wanted.contains(k)) {
+                yield input;
+            }
+        } else if (name == "paths") {
+            let root: list[Any] = [];
+            for (each_path in paths_of(input, root)) {
+                let path = unwrap(each_path);
+                yield path;
+            }
+        } else if (name == "input_filename") {
+            yield env.filename;
+        } else if (name == "select") {
+            for (each_verdict in run(args[0], input, env)) {
+                let verdict = unwrap(each_verdict);
+                if (truthy(verdict)) {
+                    yield input;
+                }
+            }
+        } else if (name == "map") {
+            var out: list[Any] = [];
+            for (item in children(input)) {
+                for (each_value in run(args[0], item, env)) {
+                    let value = unwrap(each_value);
+                    out.push(value);
+                }
+            }
+            yield out;
+        } else if (name == "map_values") {
+            yield map_values(input, args[0], env);
+        } else if (name == "with_entries") {
+            var changed: list[Any] = [];
+            for (entry in entries_of(input)) {
+                for (each_value in run(args[0], entry, env)) {
+                    let value = unwrap(each_value);
+                    changed.push(value);
+                }
+            }
+            yield object_of(changed);
+        } else if (name == "any" or name == "all") {
+            let verdicts = map(array_input(input, name), func(item: Any): bool {
+                return any(outputs_of(args[0], item, env), func(v: Any): bool { return truthy(v); });
+            });
+            if (name == "any") {
+                yield any(verdicts, func(v: bool): bool { return v; });
+            } else {
+                yield all(verdicts, func(v: bool): bool { return v; });
+            }
+        } else if (name == "sort_by") {
+            yield sort_by(array_input(input, name), args[0], env);
+        } else if (name == "group_by") {
+            yield group_by(array_input(input, name), args[0], env);
+        } else if (name == "unique_by") {
+            var firsts: list[Any] = [];
+            for (group in group_by(array_input(input, name), args[0], env)) {
+                firsts.push(as_array(group)![0]);
+            }
+            yield firsts;
+        } else if (name == "min_by" or name == "max_by") {
+            let items = array_input(input, name);
+            yield extreme(items, keys_by(items, args[0], env), name == "max_by");
+        } else if (name == "range") {
+            for (each_value in ranges(args, input, env)) {
+                let value = unwrap(each_value);
+                yield value;
+            }
+        } else if (name == "first") {
+            var found = false;
+            for (each_value in run(args[0], input, env)) {
+                let value = unwrap(each_value);
+                if (!found) {
+                    found = true;
+                    yield value;
+                }
+                break;
+            }
+        } else if (name == "limit") {
+            for (each_count in run(args[0], input, env)) {
+                let count = unwrap(each_count);
+                var left = to_float(count) as int;
+                if (left > 0) {
+                    for (each_value in run(args[1], input, env)) {
+                        let value = unwrap(each_value);
+                        yield value;
+                        left -= 1;
+                        if (left <= 0) {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            throw JqError(name + "/" + str(args.len()) + " is not defined");
+        }
+    } catch (JqError as e) {
+        yield Failure(e.message);
+    }
+}
+
+# `range(n)`, `range(from; upto)`, `range(from; upto; by)`, for every
+# combination of the arguments' values.
+gen func ranges(args: list[Node], input: Any, env: Env): Iterable[Any] {
+    try {
+        if (args.len() == 1) {
+            for (each_upto in run(args[0], input, env)) {
+                let upto = unwrap(each_upto);
+                for (k in rangeFrom(0, to_float(upto) as int)) {
+                    yield k;
+                }
+            }
+        } else {
+            for (each_start in run(args[0], input, env)) {
+                let start = unwrap(each_start);
+                for (each_upto in run(args[1], input, env)) {
+                    let upto = unwrap(each_upto);
+                    if (args.len() == 2) {
+                        for (k in rangeFrom(to_float(start) as int, to_float(upto) as int)) {
+                            yield k;
+                        }
+                    } else {
+                        for (each_by in run(args[2], input, env)) {
+                            let by = unwrap(each_by);
+                            let step = to_float(by) as int;
+                            if (step == 0) {
+                                throw JqError("range step must not be zero");
+                            }
+                            for (k in rangeStep(to_float(start) as int, to_float(upto) as int, step)) {
+                                yield k;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (JqError as e) {
+        yield Failure(e.message);
+    }
+}
+
+# `map_values(f)`: each value replaced by the first output of f; a value
+# with no output is dropped. Objects go through mapValues and filterKeys.
+func map_values(input: Any, f: Node, env: Env): Any {
+    match as_object(input) {
+        Some(d) => {
+            let firsts = mapValues(d, func(value: Any): Any { return first_output(f, value, env); });
+            return filterKeys(firsts, func(key: string): bool { return !(firsts[key] is Missing); });
+        },
+        None => {},
+    }
+    var out: list[Any] = [];
+    for (item in array_input(input, "map_values")) {
+        let value = first_output(f, item, env);
+        if (!(value is Missing)) {
+            out.push(value);
+        }
+    }
+    return out;
+}
+
+# The path (keys and indices) of everything inside a value, depth first.
+gen func paths_of(value: Any, prefix: list[Any]): Iterable[Any] {
+    match as_object(value) {
+        Some(members) => {
+            for (key in members.keys()) {
+                var path = prefix;
+                path.push(key);
+                yield path;
+                for (each_inner in paths_of(members[key], path)) {
+                    let inner = unwrap(each_inner);
+                    yield inner;
+                }
+            }
+        },
+        None => {
+            match as_array(value) {
+                Some(items) => {
+                    for (k in 0..items.len()) {
+                        var path = prefix;
+                        path.push(k);
+                        yield path;
+                        for (each_inner in paths_of(items[k], path)) {
+                            let inner = unwrap(each_inner);
+                            yield inner;
+                        }
+                    }
+                },
+                None => {},
+            }
+        },
+    }
+}
+
+# Marks "no output" where a value is expected.
+class Missing {
+}
+
+func first_output(f: Node, input: Any, env: Env): Any {
+    for (each_value in run(f, input, env)) {
+        let value = unwrap(each_value);
+        return value;
+    }
+    return Missing();
+}

@@ -1,0 +1,206 @@
+@mode(host.scripted)
+
+# yq's filter lexer: turns a jq filter into tokens.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: tokenize() scans left to right. A string token keeps its body
+# as written (escapes and `\(...)` interpolations undecoded): the parser
+# decodes it and parses each interpolation as a filter of its own, so the
+# lexer only has to find where the string ends, which skip_interpolation()
+# does by matching parentheses and nested strings.
+
+pub enum TokKind {
+    # A name: a builtin, a keyword (if, then, as, and, ...) or an object key.
+    Ident,
+    # `.name`: the text is the name.
+    Field,
+    # `$name`: the text is the name.
+    Var,
+    # `@csv` and the other formats: the text is the name.
+    Format,
+    Number,
+    # A string literal: the text is its body between the quotes.
+    Str,
+    # Punctuation and operators: `.`, `..`, `|`, `//`, `==`, ...
+    Symbol,
+    End,
+}
+
+pub struct Token {
+    pub kind: TokKind;
+    pub text: string;
+    # Offset of the token in the filter, for error messages.
+    pub pos: int;
+}
+
+# A filter that does not parse. bin/yq.lpscr reports it as
+# `yq: error: MESSAGE` and exits with status 3.
+pub class FilterSyntaxError : Exception {
+    new(message: string) {
+        super(message);
+    }
+}
+
+# Two-character symbols, tried before single characters.
+let PAIRS: list[string] = ["..", "==", "!=", "<=", ">=", "//", "|=", "+=", "-=", "*=", "/=", "?/"];
+let SINGLES: string = ".[]{}()|,:;?+-*/%<>=";
+
+func is_ident_start(c: string): bool {
+    return c == "_" or (c >= "a" and c <= "z") or (c >= "A" and c <= "Z");
+}
+
+func is_digit(c: string): bool {
+    return c >= "0" and c <= "9";
+}
+
+func is_ident_char(c: string): bool {
+    return is_ident_start(c) or is_digit(c);
+}
+
+func make(kind: TokKind, text: string, pos: int): Token {
+    return Token(kind = kind, text = text, pos = pos);
+}
+
+# The end of the name starting at `start`.
+func name_end(text: string, start: int): int {
+    var end = start;
+    while (end < text.len() and is_ident_char(text.slice(end, end + 1))) {
+        end += 1;
+    }
+    return end;
+}
+
+# The offset just past the `)` that closes an interpolation whose `(` is at
+# `open`, skipping nested parentheses and strings.
+pub func skip_interpolation(text: string, open: int): int {
+    var depth = 0;
+    var k = open;
+    while (k < text.len()) {
+        let c = text.slice(k, k + 1);
+        if (c == "(") {
+            depth += 1;
+        } else if (c == ")") {
+            depth -= 1;
+            if (depth == 0) {
+                return k + 1;
+            }
+        } else if (c == "\"") {
+            k = string_end(text, k) - 1;
+        }
+        k += 1;
+    }
+    throw FilterSyntaxError("unterminated string interpolation");
+}
+
+# The offset just past the closing quote of the string whose opening quote
+# is at `open`.
+func string_end(text: string, open: int): int {
+    var k = open + 1;
+    while (k < text.len()) {
+        let c = text.slice(k, k + 1);
+        if (c == "\"") {
+            return k + 1;
+        }
+        if (c == "\\") {
+            if (text.slice(k + 1, k + 2) == "(") {
+                k = skip_interpolation(text, k + 1);
+                continue;
+            }
+            k += 2;
+            continue;
+        }
+        k += 1;
+    }
+    throw FilterSyntaxError("unterminated string literal");
+}
+
+pub func tokenize(text: string): list[Token] {
+    var tokens: list[Token] = [];
+    var k = 0;
+    let n = text.len();
+    while (k < n) {
+        let c = text.slice(k, k + 1);
+        if (c == " " or c == "\t" or c == "\n" or c == "\r") {
+            k += 1;
+            continue;
+        }
+        if (c == "#") {
+            # A comment runs to the end of the line.
+            while (k < n and text.slice(k, k + 1) != "\n") {
+                k += 1;
+            }
+            continue;
+        }
+        if (c == "\"") {
+            let end = string_end(text, k);
+            tokens.push(make(TokKind.Str, text.slice(k + 1, end - 1), k));
+            k = end;
+            continue;
+        }
+        if (c == "." and k + 1 < n and is_ident_start(text.slice(k + 1, k + 2))) {
+            let end = name_end(text, k + 1);
+            tokens.push(make(TokKind.Field, text.slice(k + 1, end), k));
+            k = end;
+            continue;
+        }
+        if ((c == "$" or c == "@") and k + 1 < n and is_ident_start(text.slice(k + 1, k + 2))) {
+            let end = name_end(text, k + 1);
+            let kind = if (c == "$") { TokKind.Var } else { TokKind.Format };
+            tokens.push(make(kind, text.slice(k + 1, end), k));
+            k = end;
+            continue;
+        }
+        if (is_ident_start(c)) {
+            let end = name_end(text, k);
+            tokens.push(make(TokKind.Ident, text.slice(k, end), k));
+            k = end;
+            continue;
+        }
+        if (is_digit(c)) {
+            var end = k;
+            while (end < n and is_digit(text.slice(end, end + 1))) {
+                end += 1;
+            }
+            if (end + 1 < n and text.slice(end, end + 1) == "." and is_digit(text.slice(end + 1, end + 2))) {
+                end += 1;
+                while (end < n and is_digit(text.slice(end, end + 1))) {
+                    end += 1;
+                }
+            }
+            let e = text.slice(end, end + 1);
+            if (e == "e" or e == "E") {
+                var after = end + 1;
+                let s = text.slice(after, after + 1);
+                if (s == "+" or s == "-") {
+                    after += 1;
+                }
+                if (after < n and is_digit(text.slice(after, after + 1))) {
+                    end = after;
+                    while (end < n and is_digit(text.slice(end, end + 1))) {
+                        end += 1;
+                    }
+                }
+            }
+            tokens.push(make(TokKind.Number, text.slice(k, end), k));
+            k = end;
+            continue;
+        }
+        let pair = text.slice(k, k + 2);
+        if (PAIRS.contains(pair)) {
+            tokens.push(make(TokKind.Symbol, pair, k));
+            k += 2;
+            continue;
+        }
+        if (SINGLES.contains(c)) {
+            tokens.push(make(TokKind.Symbol, c, k));
+            k += 1;
+            continue;
+        }
+        throw FilterSyntaxError("unexpected character '" + c + "' at offset " + str(k));
+    }
+    tokens.push(make(TokKind.End, "", n));
+    return tokens;
+}

@@ -1,0 +1,527 @@
+@mode(host.scripted)
+
+# yq's filter parser: turns the tokens of a jq filter into a Node tree.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: recursive descent with one method per precedence level, from
+# the loosest to the tightest, as in jq: `|` < `,` < `//` < `or` < `and` <
+# comparisons < `+ -` < `* / %` < unary `-` < postfix (`.name`, `[...]`,
+# `?`, `as $x | ...`) < terms. String literals are decoded here, and each
+# `\(...)` inside one is parsed by a parser of its own. Variables are
+# checked against the names in scope, so `$typo` is a compile error.
+
+from .lexer import (Token, TokKind, FilterSyntaxError, tokenize, skip_interpolation);
+from .ast import (Node);
+from .builtins import (BUILTINS);
+
+# What follows a backslash in a string literal, and what it stands for.
+let ESCAPES: dict[string, string] = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "b": str(char.of(8)),
+    "f": str(char.of(12)),
+    "\"": "\"",
+    "\\": "\\",
+    "/": "/",
+};
+
+# A literal node. (An enum payload of type Any does not take a string or a
+# number directly under Stage0; a function parameter does.)
+func lit(value: Any): Node {
+    return Node.Literal(value = value);
+}
+
+# Words jq has but this subset does not.
+let UNSUPPORTED: set[string] = {"reduce", "foreach", "def", "try", "catch", "label", "import", "include"};
+
+pub class Parser {
+    let tokens: list[Token];
+    var at: int = 0;
+    # The variables visible at this point: --arg names, then `as` bindings.
+    var scope: list[string];
+
+    new(source: string, names: list[string]) {
+        this.tokens = tokenize(source);
+        this.scope = names;
+    }
+
+    func peek(): Token {
+        return this.tokens[this.at];
+    }
+
+    func is_symbol(text: string): bool {
+        let tok = this.peek();
+        return tok.kind == TokKind.Symbol and tok.text == text;
+    }
+
+    func is_word(text: string): bool {
+        let tok = this.peek();
+        return tok.kind == TokKind.Ident and tok.text == text;
+    }
+
+    modifier func advance(): Token {
+        let tok = this.tokens[this.at];
+        if (tok.kind != TokKind.End) {
+            this.at += 1;
+        }
+        return tok;
+    }
+
+    # The message for the token at hand when it does not fit. (Stage0 does
+    # not accept `throw` of a value returned by a method, so callers throw
+    # FilterSyntaxError(this.unexpected()).)
+    func unexpected(): string {
+        let tok = this.peek();
+        if (tok.kind == TokKind.End) {
+            return "syntax error: unexpected end of filter";
+        }
+        let shown = if (tok.kind == TokKind.Str) { "\"" + tok.text + "\"" } else { tok.text };
+        return "syntax error: unexpected '" + shown + "' at offset " + str(tok.pos);
+    }
+
+    # Consumes a symbol or keyword, or fails.
+    modifier func expect(text: string): void {
+        if (!this.is_symbol(text) and !this.is_word(text)) {
+            throw FilterSyntaxError(this.unexpected());
+        }
+        this.advance();
+    }
+
+    pub modifier func parse(): Node {
+        let node = this.pipe();
+        if (this.peek().kind != TokKind.End) {
+            throw FilterSyntaxError(this.unexpected());
+        }
+        return node;
+    }
+
+    modifier func pipe(): Node {
+        let left = this.comma();
+        if (this.is_symbol("|")) {
+            this.advance();
+            return Node.Pipe(left = left, right = this.pipe());
+        }
+        return left;
+    }
+
+    modifier func comma(): Node {
+        var left = this.alternative();
+        while (this.is_symbol(",")) {
+            this.advance();
+            left = Node.Comma(left = left, right = this.alternative());
+        }
+        return left;
+    }
+
+    # `//` groups to the right: `a // b // c` is `a // (b // c)`.
+    modifier func alternative(): Node {
+        let left = this.disjunction();
+        if (this.is_symbol("//")) {
+            this.advance();
+            return Node.Alternative(left = left, right = this.alternative());
+        }
+        return left;
+    }
+
+    modifier func disjunction(): Node {
+        var left = this.conjunction();
+        while (this.is_word("or")) {
+            this.advance();
+            left = Node.Or(left = left, right = this.conjunction());
+        }
+        return left;
+    }
+
+    modifier func conjunction(): Node {
+        var left = this.comparison();
+        while (this.is_word("and")) {
+            this.advance();
+            left = Node.And(left = left, right = this.comparison());
+        }
+        return left;
+    }
+
+    modifier func comparison(): Node {
+        let left = this.additive();
+        for (op in ["==", "!=", "<=", ">=", "<", ">"]) {
+            if (this.is_symbol(op)) {
+                this.advance();
+                return Node.Binary(op = op, left = left, right = this.additive());
+            }
+        }
+        if (this.is_symbol("=") or this.is_symbol("|=") or this.is_symbol("+=") or this.is_symbol("-=")) {
+            throw FilterSyntaxError("assignment (" + this.peek().text + ") is not supported");
+        }
+        return left;
+    }
+
+    modifier func additive(): Node {
+        var left = this.multiplicative();
+        while (this.is_symbol("+") or this.is_symbol("-")) {
+            let op = this.advance().text;
+            left = Node.Binary(op = op, left = left, right = this.multiplicative());
+        }
+        return left;
+    }
+
+    modifier func multiplicative(): Node {
+        var left = this.unary();
+        while (this.is_symbol("*") or this.is_symbol("/") or this.is_symbol("%")) {
+            let op = this.advance().text;
+            left = Node.Binary(op = op, left = left, right = this.unary());
+        }
+        return left;
+    }
+
+    modifier func unary(): Node {
+        if (this.is_symbol("-")) {
+            this.advance();
+            return Node.Negate(body = this.unary());
+        }
+        return this.postfix();
+    }
+
+    # A term and what follows it: `.name`, `."name"`, `[...]`, `?`, and
+    # `as $name | BODY`, whose body runs to the end of the enclosing pipe.
+    modifier func postfix(): Node {
+        var node = this.term();
+        while (true) {
+            let tok = this.peek();
+            if (tok.kind == TokKind.Field) {
+                this.advance();
+                node = Node.Index(target = node, key = lit(tok.text));
+            } else if (this.is_symbol(".") and this.tokens[this.at + 1].kind == TokKind.Str) {
+                this.advance();
+                node = Node.Index(target = node, key = string_node(this.advance().text, this.scope));
+            } else if (this.is_symbol("[")) {
+                this.advance();
+                node = this.bracket(node);
+            } else if (this.is_symbol("?")) {
+                this.advance();
+                node = Node.Try(body = node);
+            } else if (this.is_word("as")) {
+                this.advance();
+                let tok_var = this.advance();
+                if (tok_var.kind != TokKind.Var) {
+                    throw FilterSyntaxError("syntax error: expected $name after 'as'");
+                }
+                this.expect("|");
+                this.scope.push(tok_var.text);
+                let body = this.pipe();
+                this.scope.pop();
+                return Node.Bind(source = node, name = tok_var.text, body = body);
+            } else {
+                return node;
+            }
+        }
+        return node;
+    }
+
+    # After `[`: `]` (iterate), `KEY]`, `START:STOP]`, `:STOP]`, `START:]`.
+    modifier func bracket(target: Node): Node {
+        let none = lit(None);
+        if (this.is_symbol("]")) {
+            this.advance();
+            return Node.Each(target = target);
+        }
+        if (this.is_symbol(":")) {
+            this.advance();
+            let stop = this.pipe();
+            this.expect("]");
+            return Node.Slice(target = target, start = none, stop = stop);
+        }
+        let key = this.pipe();
+        if (this.is_symbol(":")) {
+            this.advance();
+            var stop = none;
+            if (!this.is_symbol("]")) {
+                stop = this.pipe();
+            }
+            this.expect("]");
+            return Node.Slice(target = target, start = key, stop = stop);
+        }
+        this.expect("]");
+        return Node.Index(target = target, key = key);
+    }
+
+    modifier func term(): Node {
+        let tok = this.peek();
+        match tok.kind {
+            TokKind.Number => {
+                this.advance();
+                return lit(number_literal(tok.text));
+            },
+            TokKind.Str => {
+                this.advance();
+                return string_node(tok.text, this.scope);
+            },
+            TokKind.Field => {
+                this.advance();
+                return Node.Index(target = Node.Identity, key = lit(tok.text));
+            },
+            TokKind.Var => {
+                this.advance();
+                if (!this.scope.contains(tok.text)) {
+                    throw FilterSyntaxError("$" + tok.text + " is not defined");
+                }
+                return Node.Variable(name = tok.text);
+            },
+            TokKind.Format => {
+                this.advance();
+                let name = "@" + tok.text;
+                if (!BUILTINS.contains(name + "/0")) {
+                    throw FilterSyntaxError(name + " is not a valid format");
+                }
+                let format = Node.Call(name = name, args = []);
+                if (this.peek().kind == TokKind.Str) {
+                    # `@csv "row: \(.)"`: the format applies to what is
+                    # interpolated, not to the literal text.
+                    let text = string_node(this.advance().text, this.scope);
+                    match text {
+                        Node.Interpolate(parts) => {
+                            var formatted: list[Node] = [];
+                            for (part in parts) {
+                                match part {
+                                    Node.Literal(value) => {
+                                        formatted.push(part);
+                                    },
+                                    _ => {
+                                        formatted.push(Node.Pipe(left = part, right = format));
+                                    },
+                                }
+                            }
+                            return Node.Interpolate(parts = formatted);
+                        },
+                        _ => {
+                            return text;
+                        },
+                    }
+                }
+                return format;
+            },
+            TokKind.Ident => {
+                return this.word();
+            },
+            _ => {},
+        }
+        if (this.is_symbol(".")) {
+            this.advance();
+            if (this.peek().kind == TokKind.Str) {
+                return Node.Index(target = Node.Identity, key = string_node(this.advance().text, this.scope));
+            }
+            return Node.Identity;
+        }
+        if (this.is_symbol("..")) {
+            this.advance();
+            return Node.RecurseAll;
+        }
+        if (this.is_symbol("(")) {
+            this.advance();
+            let inner = this.pipe();
+            this.expect(")");
+            return inner;
+        }
+        if (this.is_symbol("[")) {
+            this.advance();
+            if (this.is_symbol("]")) {
+                this.advance();
+                return Node.Collect(body = Node.Call(name = "empty", args = []));
+            }
+            let body = this.pipe();
+            this.expect("]");
+            return Node.Collect(body = body);
+        }
+        if (this.is_symbol("{")) {
+            this.advance();
+            return this.construct();
+        }
+        throw FilterSyntaxError(this.unexpected());
+    }
+
+    # A name at the start of a term: a constant, `if`, or a builtin call.
+    modifier func word(): Node {
+        let name = this.advance().text;
+        if (name == "true" or name == "false") {
+            return lit(name == "true");
+        }
+        if (name == "null") {
+            return lit(None);
+        }
+        if (name == "if") {
+            return this.conditional();
+        }
+        if (UNSUPPORTED.contains(name)) {
+            throw FilterSyntaxError("'" + name + "' is not supported by this yq");
+        }
+        var args: list[Node] = [];
+        if (this.is_symbol("(")) {
+            this.advance();
+            args.push(this.pipe());
+            while (this.is_symbol(";")) {
+                this.advance();
+                args.push(this.pipe());
+            }
+            this.expect(")");
+        }
+        let signature = name + "/" + str(args.len());
+        if (!BUILTINS.contains(signature)) {
+            throw FilterSyntaxError(signature + " is not defined");
+        }
+        return Node.Call(name = name, args = args);
+    }
+
+    # After `if` (or `elif`): COND then BRANCH, then elif, else or end. A
+    # missing else leaves the input unchanged.
+    modifier func conditional(): Node {
+        let cond = this.pipe();
+        this.expect("then");
+        let then_branch = this.pipe();
+        if (this.is_word("elif")) {
+            this.advance();
+            return Node.If(cond = cond, then = then_branch, otherwise = this.conditional());
+        }
+        var otherwise = Node.Identity;
+        if (this.is_word("else")) {
+            this.advance();
+            otherwise = this.pipe();
+        }
+        this.expect("end");
+        return Node.If(cond = cond, then = then_branch, otherwise = otherwise);
+    }
+
+    # After `{`: `KEY: VALUE` pairs, where KEY is a name, a string, a
+    # `$var` or `(FILTER)`; `{name}` and `{$var}` are shorthands.
+    modifier func construct(): Node {
+        var keys: list[Node] = [];
+        var values: list[Node] = [];
+        while (!this.is_symbol("}")) {
+            let tok = this.peek();
+            if (tok.kind == TokKind.Ident or tok.kind == TokKind.Str) {
+                this.advance();
+                let key = if (tok.kind == TokKind.Ident) { lit(tok.text) } else { string_node(tok.text, this.scope) };
+                keys.push(key);
+                if (this.is_symbol(":")) {
+                    this.advance();
+                    values.push(this.object_value());
+                } else {
+                    values.push(Node.Index(target = Node.Identity, key = key));
+                }
+            } else if (tok.kind == TokKind.Var) {
+                this.advance();
+                if (!this.scope.contains(tok.text)) {
+                    throw FilterSyntaxError("$" + tok.text + " is not defined");
+                }
+                keys.push(lit(tok.text));
+                values.push(Node.Variable(name = tok.text));
+            } else if (this.is_symbol("(")) {
+                this.advance();
+                keys.push(this.pipe());
+                this.expect(")");
+                this.expect(":");
+                values.push(this.object_value());
+            } else {
+                throw FilterSyntaxError(this.unexpected());
+            }
+            if (!this.is_symbol("}")) {
+                this.expect(",");
+            }
+        }
+        this.advance();
+        return Node.Construct(keys = keys, values = values);
+    }
+
+    # An object value: no commas (they separate the pairs), but pipes.
+    modifier func object_value(): Node {
+        var value = this.alternative();
+        while (this.is_symbol("|")) {
+            this.advance();
+            value = Node.Pipe(left = value, right = this.alternative());
+        }
+        return value;
+    }
+}
+
+# Compiles a filter; `names` are the variables defined from outside (--arg).
+pub func compile(source: string, names: list[string]): Node {
+    let parser = Parser(source, names);
+    var node = Node.Identity;
+    safe {
+        node = parser.parse();
+    }
+    return node;
+}
+
+func number_literal(text: string): Any {
+    if (text.contains(".") or text.contains("e") or text.contains("E")) {
+        return text.toFloat();
+    }
+    return text.toInt();
+}
+
+# The value of the hex digits in `digits`, or -1.
+func hex_value(digits: string): int {
+    var value = 0;
+    for (c in digits.toLowerCase()) {
+        let d = "0123456789abcdef".index_of(c);
+        if (d < 0) {
+            return -1;
+        }
+        value = value * 16 + d;
+    }
+    return value;
+}
+
+# A string literal's body as a node: a Literal, or an Interpolate of
+# literal pieces and the filters inside `\(...)`.
+func string_node(body: string, names: list[string]): Node {
+    var parts: list[Node] = [];
+    var piece = "";
+    var interpolated = false;
+    var k = 0;
+    while (k < body.len()) {
+        let c = body.slice(k, k + 1);
+        if (c != "\\") {
+            piece = piece + c;
+            k += 1;
+            continue;
+        }
+        let e = body.slice(k + 1, k + 2);
+        if (e == "(") {
+            let close = skip_interpolation(body, k + 1);
+            if (piece != "") {
+                parts.push(lit(piece));
+                piece = "";
+            }
+            parts.push(compile(body.slice(k + 2, close - 1), names));
+            interpolated = true;
+            k = close;
+            continue;
+        }
+        if (e == "u") {
+            let code = hex_value(body.slice(k + 2, k + 6));
+            if (code < 0 or body.len() < k + 6) {
+                throw FilterSyntaxError("invalid \\u escape in string literal");
+            }
+            piece = piece + str(char.of(code));
+            k += 6;
+            continue;
+        }
+        let decoded = ESCAPES.get(e);
+        if (decoded.is_none()) {
+            throw FilterSyntaxError("invalid escape \\" + e + " in string literal");
+        }
+        piece = piece + decoded!;
+        k += 2;
+    }
+    if (!interpolated) {
+        return lit(piece);
+    }
+    if (piece != "") {
+        parts.push(lit(piece));
+    }
+    return Node.Interpolate(parts = parts);
+}

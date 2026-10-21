@@ -1,0 +1,259 @@
+@mode(host.scripted)
+
+# yq's reader for YAML flow collections (`[a, b]`, `{k: v}`) and plain
+# scalars: the parts of YAML that data.yaml leaves as text.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: scalar_value() types a plain scalar with data.yaml's rules, so
+# a value means the same in block and flow style. FlowReader is a small
+# recursive-descent reader over the characters of one flow collection.
+
+
+# A flow collection that does not read. lib/yamlin.lpscr adds the file and
+# line.
+pub class FlowError : Exception {
+    new(message: string) {
+        super(message);
+    }
+}
+
+func is_int_text(text: string): bool {
+    var digits = text;
+    if (text.startsWith("-") or text.startsWith("+")) {
+        digits = text.slice(1);
+    }
+    if (digits == "") {
+        return false;
+    }
+    for (c in digits) {
+        if (c < "0" or c > "9") {
+            return false;
+        }
+    }
+    return true;
+}
+
+func is_float_text(text: string): bool {
+    var body = text;
+    if (text.startsWith("-") or text.startsWith("+")) {
+        body = text.slice(1);
+    }
+    var digits = 0;
+    var dots = 0;
+    var exponents = 0;
+    var k = 0;
+    while (k < body.len()) {
+        let c = body.slice(k, k + 1);
+        if (c >= "0" and c <= "9") {
+            digits += 1;
+        } else if (c == "." and exponents == 0) {
+            dots += 1;
+        } else if ((c == "e" or c == "E") and digits > 0 and exponents == 0) {
+            exponents += 1;
+            let sign = body.slice(k + 1, k + 2);
+            if (sign == "+" or sign == "-") {
+                k += 1;
+            }
+        } else {
+            return false;
+        }
+        k += 1;
+    }
+    return digits > 0 and dots <= 1 and (dots == 1 or exponents == 1);
+}
+
+# A plain (unquoted) scalar's value, by data.yaml's rules: null and ~ are
+# null, true and false booleans, decimal integers and floats numbers, and
+# anything else the text itself.
+pub func scalar_value(raw: string): Any {
+    let text = raw.trim();
+    if (text == "" or text == "null" or text == "~") {
+        return None;
+    }
+    if (text == "true") {
+        return true;
+    }
+    if (text == "false") {
+        return false;
+    }
+    if (is_int_text(text)) {
+        # More digits than a 64-bit integer holds: a float, as in jq.
+        if (text.len() > 18) {
+            return text.toFloat();
+        }
+        return text.toInt();
+    }
+    if (is_float_text(text)) {
+        return text.toFloat();
+    }
+    return text;
+}
+
+# The body of a double-quoted YAML string, escapes decoded.
+pub func unescape_double(body: string): string {
+    var out = "";
+    var k = 0;
+    while (k < body.len()) {
+        let c = body.slice(k, k + 1);
+        if (c == "\\" and k + 1 < body.len()) {
+            let e = body.slice(k + 1, k + 2);
+            if (e == "n") {
+                out = out + "\n";
+            } else if (e == "t") {
+                out = out + "\t";
+            } else if (e == "r") {
+                out = out + "\r";
+            } else if (e == "0") {
+                out = out + str(char.of(0));
+            } else {
+                out = out + e;
+            }
+            k += 2;
+        } else {
+            out = out + c;
+            k += 1;
+        }
+    }
+    return out;
+}
+
+class FlowReader {
+    let text: string;
+    var at: int = 0;
+
+    new(text: string) {
+        this.text = text;
+    }
+
+    func peek(): string {
+        return this.text.slice(this.at, this.at + 1);
+    }
+
+    modifier func skip_spaces(): void {
+        while (this.at < this.text.len() and " \t\n\r".contains(this.peek())) {
+            this.at += 1;
+        }
+    }
+
+    modifier func expect(c: string): void {
+        this.skip_spaces();
+        if (this.peek() != c) {
+            throw FlowError("expected '" + c + "' at column " + str(this.at + 1) + " of " + this.text);
+        }
+        this.at += 1;
+    }
+
+    pub modifier func value(stops: string): Any {
+        this.skip_spaces();
+        let c = this.peek();
+        if (c == "[") {
+            this.at += 1;
+            return this.sequence();
+        }
+        if (c == "{") {
+            this.at += 1;
+            return this.mapping();
+        }
+        if (c == "\"" or c == "'") {
+            return this.quoted();
+        }
+        let start = this.at;
+        while (this.at < this.text.len() and !stops.contains(this.peek())) {
+            this.at += 1;
+        }
+        return scalar_value(this.text.slice(start, this.at));
+    }
+
+    modifier func quoted(): string {
+        let quote = this.peek();
+        this.at += 1;
+        var body = "";
+        while (this.at < this.text.len()) {
+            let c = this.peek();
+            if (quote == "\"" and c == "\\") {
+                body = body + this.text.slice(this.at, this.at + 2);
+                this.at += 2;
+                continue;
+            }
+            if (c == quote) {
+                # '' is a quote inside a single-quoted string.
+                if (quote == "'" and this.text.slice(this.at + 1, this.at + 2) == "'") {
+                    body = body + "'";
+                    this.at += 2;
+                    continue;
+                }
+                this.at += 1;
+                return if (quote == "\"") { unescape_double(body) } else { body };
+            }
+            body = body + c;
+            this.at += 1;
+        }
+        throw FlowError("unterminated quoted string in " + this.text);
+    }
+
+    modifier func sequence(): Any {
+        var items: list[Any] = [];
+        this.skip_spaces();
+        while (this.peek() != "]") {
+            items.push(this.value(",]"));
+            this.skip_spaces();
+            if (this.peek() == ",") {
+                this.at += 1;
+                this.skip_spaces();
+            } else if (this.peek() != "]") {
+                throw FlowError("expected ',' or ']' at column " + str(this.at + 1) + " of " + this.text);
+            }
+        }
+        this.at += 1;
+        return items;
+    }
+
+    modifier func mapping(): Any {
+        var members: dict[string, Any] = {};
+        this.skip_spaces();
+        while (this.peek() != "}") {
+            let key = this.value(":,}");
+            if (key == None) {
+                throw FlowError("missing key at column " + str(this.at + 1) + " of " + this.text);
+            }
+            this.skip_spaces();
+            var member: Any = None;
+            if (this.peek() == ":") {
+                this.at += 1;
+                member = this.value(",}");
+                this.skip_spaces();
+            }
+            members[str(key)] = member;
+            if (this.peek() == ",") {
+                this.at += 1;
+                this.skip_spaces();
+            } else if (this.peek() != "}") {
+                throw FlowError("expected ',' or '}' at column " + str(this.at + 1) + " of " + this.text);
+            }
+        }
+        this.at += 1;
+        return members;
+    }
+
+    pub modifier func finish(): void {
+        this.skip_spaces();
+        if (this.at < this.text.len() and this.peek() != "#") {
+            throw FlowError("unexpected text after a flow collection: " + this.text.slice(this.at));
+        }
+    }
+}
+
+# The value of one flow collection (or scalar), with nothing after it but
+# a comment.
+pub func parse_flow(text: string): Any {
+    let reader = FlowReader(text);
+    var result: Any = None;
+    safe {
+        result = reader.value("");
+        reader.finish();
+    }
+    return result;
+}

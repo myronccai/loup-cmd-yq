@@ -1,0 +1,459 @@
+@mode(host.scripted)
+
+# yq's evaluator: runs a filter on one input and produces its outputs.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: jq filters produce streams, so run() is a generator: it
+# matches the node and yields each output as it is found, recursing into
+# the node's parts (`a | b` runs b on every output of a). Nothing is
+# collected unless the filter asks for it (`[...]`), so `first(..)` stops
+# early and an error after some outputs still lets those through. The
+# helpers below it index, slice and walk the dynamic values.
+
+from .ast import (Node);
+from .values import (JqError, Failure, unwrap, kind, truthy, describe, as_array, as_object, to_float, compare, equal, add, subtract, multiply, divide, modulo, is_number);
+from .builtins import (call_builtin, text_of);
+
+# The variables of a run and the name of the input file (null for standard
+# input or -n).
+pub class Env {
+    pub let vars: dict[string, Any];
+    pub let filename: Any;
+
+    new(vars: dict[string, Any], filename: Any) {
+        this.vars = vars;
+        this.filename = filename;
+    }
+
+    pub func lookup(name: string): Any {
+        match this.vars.get(name) {
+            Some(value) => {
+                return value;
+            },
+            None => {
+                throw JqError("$" + name + " is not defined");
+            },
+        }
+    }
+
+    # A new scope with one more variable.
+    pub func with_var(name: string, value: Any): Env {
+        var vars: dict[string, Any] = {};
+        for (key in this.vars.keys()) {
+            vars[key] = this.vars[key];
+        }
+        vars[name] = value;
+        return Env(vars, this.filename);
+    }
+}
+
+pub gen func run(node: Node, input: Any, env: Env): Iterable[Any] {
+    try {
+        match node {
+            Node.Identity => {
+                yield input;
+            },
+            Node.RecurseAll => {
+                for (each_value in descend(input)) {
+                    let value = unwrap(each_value);
+                    yield value;
+                }
+            },
+            Node.Literal(value) => {
+                yield value;
+            },
+            Node.Interpolate(parts) => {
+                for (each_text in interpolate(parts, 0, "", input, env)) {
+                    let text = unwrap(each_text);
+                    yield text;
+                }
+            },
+            Node.Variable(name) => {
+                yield env.lookup(name);
+            },
+            Node.Index(target, key) => {
+                for (each_container in run(target, input, env)) {
+                    let container = unwrap(each_container);
+                    for (each_k in run(key, input, env)) {
+                        let k = unwrap(each_k);
+                        yield index_value(container, k);
+                    }
+                }
+            },
+            Node.Slice(target, start, stop) => {
+                for (each_container in run(target, input, env)) {
+                    let container = unwrap(each_container);
+                    for (each_a in run(start, input, env)) {
+                        let a = unwrap(each_a);
+                        for (each_b in run(stop, input, env)) {
+                            let b = unwrap(each_b);
+                            yield slice_value(container, a, b);
+                        }
+                    }
+                }
+            },
+            Node.Each(target) => {
+                for (each_container in run(target, input, env)) {
+                    let container = unwrap(each_container);
+                    for (value in children(container)) {
+                        yield value;
+                    }
+                }
+            },
+            Node.Pipe(left, right) => {
+                for (each_middle in run(left, input, env)) {
+                    let middle = unwrap(each_middle);
+                    for (each_value in run(right, middle, env)) {
+                        let value = unwrap(each_value);
+                        yield value;
+                    }
+                }
+            },
+            Node.Comma(left, right) => {
+                for (each_value in run(left, input, env)) {
+                    let value = unwrap(each_value);
+                    yield value;
+                }
+                for (each_value in run(right, input, env)) {
+                    let value = unwrap(each_value);
+                    yield value;
+                }
+            },
+            Node.Collect(body) => {
+                var items: list[Any] = [];
+                for (each_value in run(body, input, env)) {
+                    let value = unwrap(each_value);
+                    items.push(value);
+                }
+                yield items;
+            },
+            Node.Construct(keys, values) => {
+                let empty: dict[string, Any] = {};
+                for (each_made in construct(keys, values, 0, empty, input, env)) {
+                    let made = unwrap(each_made);
+                    yield made;
+                }
+            },
+            Node.Binary(op, left, right) => {
+                # jq's order: for each right value, each left value.
+                for (each_b in run(right, input, env)) {
+                    let b = unwrap(each_b);
+                    for (each_a in run(left, input, env)) {
+                        let a = unwrap(each_a);
+                        yield binary(op, a, b);
+                    }
+                }
+            },
+            Node.And(left, right) => {
+                for (each_a in run(left, input, env)) {
+                    let a = unwrap(each_a);
+                    if (!truthy(a)) {
+                        yield false;
+                    } else {
+                        for (each_b in run(right, input, env)) {
+                            let b = unwrap(each_b);
+                            yield truthy(b);
+                        }
+                    }
+                }
+            },
+            Node.Or(left, right) => {
+                for (each_a in run(left, input, env)) {
+                    let a = unwrap(each_a);
+                    if (truthy(a)) {
+                        yield true;
+                    } else {
+                        for (each_b in run(right, input, env)) {
+                            let b = unwrap(each_b);
+                            yield truthy(b);
+                        }
+                    }
+                }
+            },
+            Node.Alternative(left, right) => {
+                # The true outputs of the left side (its errors count as none),
+                # or else everything the right side gives.
+                var found: list[Any] = [];
+                try {
+                    for (each_value in run(left, input, env)) {
+                        let value = unwrap(each_value);
+                        if (truthy(value)) {
+                            found.push(value);
+                        }
+                    }
+                } catch (JqError as e) {
+                }
+                if (found.len() > 0) {
+                    for (value in found) {
+                        yield value;
+                    }
+                } else {
+                    for (each_value in run(right, input, env)) {
+                        let value = unwrap(each_value);
+                        yield value;
+                    }
+                }
+            },
+            Node.Negate(body) => {
+                for (each_value in run(body, input, env)) {
+                    let value = unwrap(each_value);
+                    if (!is_number(value)) {
+                        throw JqError(describe(value) + " cannot be negated");
+                    }
+                    yield subtract(0, value);
+                }
+            },
+            Node.If(cond, then, otherwise) => {
+                for (each_c in run(cond, input, env)) {
+                    let c = unwrap(each_c);
+                    let branch = if (truthy(c)) { then } else { otherwise };
+                    for (each_value in run(branch, input, env)) {
+                        let value = unwrap(each_value);
+                        yield value;
+                    }
+                }
+            },
+            Node.Bind(source, name, body) => {
+                for (each_value in run(source, input, env)) {
+                    let value = unwrap(each_value);
+                    for (each_out in run(body, input, env.with_var(name, value))) {
+                        let out = unwrap(each_out);
+                        yield out;
+                    }
+                }
+            },
+            Node.Try(body) => {
+                # Outputs before an error still count; the error ends the stream.
+                var outputs: list[Any] = [];
+                try {
+                    for (each_value in run(body, input, env)) {
+                        let value = unwrap(each_value);
+                        outputs.push(value);
+                    }
+                } catch (JqError as e) {
+                }
+                for (value in outputs) {
+                    yield value;
+                }
+            },
+            Node.Call(name, args) => {
+                for (each_value in call_builtin(name, args, input, env)) {
+                    let value = unwrap(each_value);
+                    yield value;
+                }
+            },
+        }
+    } catch (JqError as e) {
+        # An error ends this stream; the outputs before it stand.
+        yield Failure(e.message);
+    }
+}
+
+# Every output of a filter, collected.
+pub func outputs_of(node: Node, input: Any, env: Env): list[Any] {
+    var out: list[Any] = [];
+    for (each_value in run(node, input, env)) {
+        let value = unwrap(each_value);
+        out.push(value);
+    }
+    return out;
+}
+
+# The value and everything inside it, depth first (`..`).
+pub gen func descend(value: Any): Iterable[Any] {
+    yield value;
+    let kids = kind(value);
+    if (kids == "array" or kids == "object") {
+        for (child in children(value)) {
+            for (each_inner in descend(child)) {
+                let inner = unwrap(each_inner);
+                yield inner;
+            }
+        }
+    }
+}
+
+# The elements of an array or the values of an object (`.[]`).
+pub func children(container: Any): list[Any] {
+    match as_array(container) {
+        Some(items) => {
+            return items;
+        },
+        None => {},
+    }
+    match as_object(container) {
+        Some(d) => {
+            var values: list[Any] = [];
+            for (key in d.keys()) {
+                values.push(d[key]);
+            }
+            return values;
+        },
+        None => {
+            throw JqError("Cannot iterate over " + describe(container));
+        },
+    }
+}
+
+func key_name(k: Any): string {
+    if (kind(k) == "string") {
+        return "string \"" + (k as string) + "\"";
+    }
+    return kind(k);
+}
+
+# `.[k]`: an object's member, an array's element (negative counts from the
+# end), null for anything missing or indexed on null.
+pub func index_value(container: Any, k: Any): Any {
+    let ck = kind(container);
+    let kk = kind(k);
+    if (ck == "null" and (kk == "string" or kk == "number" or kk == "null")) {
+        return None;
+    }
+    if (ck == "object" and kk == "string") {
+        return as_object(container)!.get(k as string) ?? None;
+    }
+    if (ck == "array" and kk == "number") {
+        let items = as_array(container)!;
+        var at = to_float(k) as int;
+        if (at < 0) {
+            at += items.len();
+        }
+        if (at < 0 or at >= items.len()) {
+            return None;
+        }
+        return items[at];
+    }
+    throw JqError("Cannot index " + ck + " with " + key_name(k));
+}
+
+# A bound of a slice as an offset into `size` items.
+func bound(b: Any, size: int, otherwise: int): int {
+    if (b == None) {
+        return otherwise;
+    }
+    var at = to_float(b) as int;
+    if (at < 0) {
+        at += size;
+    }
+    if (at < 0) {
+        return 0;
+    }
+    return if (at > size) { size } else { at };
+}
+
+# `.[a:b]` of an array or a string.
+pub func slice_value(container: Any, a: Any, b: Any): Any {
+    if (container == None) {
+        return None;
+    }
+    match as_array(container) {
+        Some(items) => {
+            let start = bound(a, items.len(), 0);
+            let stop = bound(b, items.len(), items.len());
+            if (stop <= start) {
+                let none: list[Any] = [];
+                return none;
+            }
+            return items.slice(start, stop);
+        },
+        None => {},
+    }
+    if (kind(container) == "string") {
+        let text = container as string;
+        let start = bound(a, text.len(), 0);
+        let stop = bound(b, text.len(), text.len());
+        if (stop <= start) {
+            return "";
+        }
+        return text.slice(start, stop);
+    }
+    throw JqError("Cannot index " + kind(container) + " with object");
+}
+
+func binary(op: string, a: Any, b: Any): Any {
+    if (op == "+") {
+        return add(a, b);
+    }
+    if (op == "-") {
+        return subtract(a, b);
+    }
+    if (op == "*") {
+        return multiply(a, b);
+    }
+    if (op == "/") {
+        return divide(a, b);
+    }
+    if (op == "%") {
+        return modulo(a, b);
+    }
+    if (op == "==") {
+        return equal(a, b);
+    }
+    if (op == "!=") {
+        return !equal(a, b);
+    }
+    let c = compare(a, b);
+    if (op == "<") {
+        return c < 0;
+    }
+    if (op == "<=") {
+        return c <= 0;
+    }
+    if (op == ">") {
+        return c > 0;
+    }
+    return c >= 0;
+}
+
+# `{k1: v1, k2: v2}` makes one object per combination of the outputs of its
+# keys and values, built up pair by pair.
+gen func construct(keys: list[Node], values: list[Node], k: int, made: dict[string, Any], input: Any, env: Env): Iterable[Any] {
+    try {
+        if (k == keys.len()) {
+            yield made;
+        } else {
+            for (each_key in run(keys[k], input, env)) {
+                let key = unwrap(each_key);
+                if (kind(key) != "string") {
+                    throw JqError("Object keys must be strings, not " + describe(key));
+                }
+                for (each_value in run(values[k], input, env)) {
+                    let value = unwrap(each_value);
+                    # dicts are values: `more` is a copy.
+                    var more = made;
+                    more[key as string] = value;
+                    for (each_whole in construct(keys, values, k + 1, more, input, env)) {
+                        let whole = unwrap(each_whole);
+                        yield whole;
+                    }
+                }
+            }
+        }
+    } catch (JqError as e) {
+        yield Failure(e.message);
+    }
+}
+
+# A string with interpolations: one string per combination of their
+# outputs, each output written as tostring would.
+gen func interpolate(parts: list[Node], k: int, prefix: string, input: Any, env: Env): Iterable[Any] {
+    try {
+        if (k == parts.len()) {
+            yield prefix;
+        } else {
+            for (each_value in run(parts[k], input, env)) {
+                let value = unwrap(each_value);
+                for (each_whole in interpolate(parts, k + 1, prefix + text_of(value), input, env)) {
+                    let whole = unwrap(each_whole);
+                    yield whole;
+                }
+            }
+        }
+    } catch (JqError as e) {
+        yield Failure(e.message);
+    }
+}

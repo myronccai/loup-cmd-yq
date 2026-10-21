@@ -1,0 +1,175 @@
+@mode(host.scripted)
+
+# yq's output: a result as JSON (system.json), as raw text, or as YAML.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: render() picks the form. The YAML writer recurses over the
+# value: a mapping writes `key: value` lines, a sequence `- item` lines, and
+# a nested collection goes on the following lines two columns deeper (a
+# sequence item's first line shares the dash, `- name: a`). Strings are
+# written plain when YAML would read them back as the same string, quoted
+# otherwise, and multi-line strings as `|` blocks.
+
+from system.json import (stringify, stringifyIndented);
+from .values import (kind, as_array, as_object, sort_keys);
+from .flow import (scalar_value);
+
+pub struct Style {
+    pub yaml: bool;
+    pub raw: bool;
+    pub indent: int;
+    pub sort: bool;
+}
+
+pub func make_style(yaml: bool, raw: bool, indent: int, sort: bool): Style {
+    return Style(yaml = yaml, raw = raw, indent = indent, sort = sort);
+}
+
+# One result as text, without a final newline.
+pub func render(value: Any, style: Style): string {
+    let v = if (style.sort) { sort_keys(value) } else { value };
+    if (style.raw and kind(v) == "string") {
+        return v as string;
+    }
+    if (style.yaml) {
+        return to_yaml(v);
+    }
+    if (style.indent == 0) {
+        return stringify(v);
+    }
+    return stringifyIndented(v, style.indent);
+}
+
+# Characters that make YAML read a plain scalar differently when they start
+# it.
+let INDICATORS: string = "-?:,[]{}#&*!|>'\"%@`";
+
+# Whether a string can be written without quotes and read back unchanged.
+func plain_safe(text: string): bool {
+    if (text == "" or text != text.trim() or INDICATORS.contains(text.slice(0, 1))) {
+        return false;
+    }
+    if (text.contains(": ") or text.contains(" #") or text.endsWith(":") or text.contains("\n") or text.contains("\t")) {
+        return false;
+    }
+    # A string that would read as null, a boolean or a number needs quotes.
+    return kind(scalar_value(text)) == "string";
+}
+
+func scalar_text(v: Any): string {
+    if (kind(v) == "string") {
+        let text = v as string;
+        return if (plain_safe(text)) { text } else { stringify(text) };
+    }
+    return stringify(v);
+}
+
+# A multi-line string as a literal block: the header and its lines.
+func block_lines(text: string, indent: int): list[string] {
+    let keep_end = text.endsWith("\n");
+    let body = if (keep_end) { text.slice(0, text.len() - 1) } else { text };
+    var out: list[string] = [if (keep_end) { "|" } else { "|-" }];
+    for (line in body.split("\n")) {
+        out.push(if (line == "") { "" } else { " ".repeat(indent) + line });
+    }
+    return out;
+}
+
+func is_block_string(v: Any): bool {
+    return kind(v) == "string" and (v as string).contains("\n") and !(v as string).startsWith(" ");
+}
+
+func empty_collection(v: Any): string {
+    match as_array(v) {
+        Some(items) => {
+            return if (items.len() == 0) { "[]" } else { "" };
+        },
+        None => {},
+    }
+    match as_object(v) {
+        Some(members) => {
+            return if (members.len() == 0) { "{}" } else { "" };
+        },
+        None => {
+            return "";
+        },
+    }
+}
+
+# The lines of `v` as a YAML block at column `indent`.
+func yaml_lines(v: Any, indent: int, edits out: list[string]): void {
+    let pad = " ".repeat(indent);
+    match as_object(v) {
+        Some(members) => {
+            for (key in members.keys()) {
+                let value = members[key];
+                let head = pad + scalar_text(key) + ":";
+                write_child(head, value, indent, edits: out);
+            }
+            return;
+        },
+        None => {},
+    }
+    match as_array(v) {
+        Some(items) => {
+            for (item in items) {
+                write_child(pad + "-", item, indent, edits: out);
+            }
+            return;
+        },
+        None => {},
+    }
+    out.push(pad + scalar_text(v));
+}
+
+# A mapping value or a sequence item after `head` ("key:" or "-").
+func write_child(head: string, value: Any, indent: int, edits out: list[string]): void {
+    let empty = empty_collection(value);
+    if (empty != "") {
+        out.push(head + " " + empty);
+        return;
+    }
+    if (is_block_string(value)) {
+        let lines = block_lines(value as string, indent + 2);
+        out.push(head + " " + lines[0]);
+        for (line in lines.slice(1)) {
+            out.push(line);
+        }
+        return;
+    }
+    let k = kind(value);
+    if (k != "array" and k != "object") {
+        out.push(head + " " + scalar_text(value));
+        return;
+    }
+    var nested: list[string] = [];
+    yaml_lines(value, indent + 2, edits: nested);
+    if (head.endsWith("-")) {
+        # A sequence item shares its first line with the dash.
+        out.push(head + " " + nested[0].trimStart());
+        for (line in nested.slice(1)) {
+            out.push(line);
+        }
+        return;
+    }
+    out.push(head);
+    for (line in nested) {
+        out.push(line);
+    }
+}
+
+pub func to_yaml(v: Any): string {
+    let empty = empty_collection(v);
+    if (empty != "") {
+        return empty;
+    }
+    if (is_block_string(v)) {
+        return block_lines(v as string, 2).join("\n");
+    }
+    var out: list[string] = [];
+    yaml_lines(v, 0, edits: out);
+    return out.join("\n");
+}

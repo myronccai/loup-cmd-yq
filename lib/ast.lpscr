@@ -1,0 +1,54 @@
+@mode(host.scripted)
+
+# yq's filter syntax tree: what lib/parser.lpscr builds from a jq filter and
+# lib/eval.lpscr runs.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+
+# A filter. Every node takes one input and produces a stream of outputs
+# (none, one or many). The enum is recursive: a Pipe holds the two filters
+# it connects.
+pub enum Node {
+    # `.`
+    Identity,
+    # `..`: the input and everything inside it, depth first.
+    RecurseAll,
+    # A number, string, true, false or null.
+    Literal(value: Any),
+    # A string with `\(...)` parts: literal pieces and filters, in order.
+    Interpolate(parts: list[Node]),
+    # `$name`
+    Variable(name: string),
+    # `TARGET[KEY]`, `.name`, `."name"`
+    Index(target: Node, key: Node),
+    # `TARGET[START:STOP]`; a missing bound is a null literal.
+    Slice(target: Node, start: Node, stop: Node),
+    # `TARGET[]`
+    Each(target: Node),
+    # `LEFT | RIGHT`
+    Pipe(left: Node, right: Node),
+    # `LEFT, RIGHT`
+    Comma(left: Node, right: Node),
+    # `[BODY]`
+    Collect(body: Node),
+    # `{KEY: VALUE, ...}`: the keys and values as filters, pairwise.
+    Construct(keys: list[Node], values: list[Node]),
+    # `+ - * / % == != < <= > >=`
+    Binary(op: string, left: Node, right: Node),
+    And(left: Node, right: Node),
+    Or(left: Node, right: Node),
+    # `LEFT // RIGHT`
+    Alternative(left: Node, right: Node),
+    # Unary `-`.
+    Negate(body: Node),
+    # `if COND then THEN else OTHERWISE end` (elif nests another If).
+    If(cond: Node, then: Node, otherwise: Node),
+    # `SOURCE as $name | BODY`
+    Bind(source: Node, name: string, body: Node),
+    # `BODY?`: errors end the stream quietly.
+    Try(body: Node),
+    # A builtin, with its arguments as filters: `map(.a)`, `@csv`.
+    Call(name: string, args: list[Node]),
+}

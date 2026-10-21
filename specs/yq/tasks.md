@@ -1,0 +1,22 @@
+# Tasks: yq
+
+- [x] 1. Layout: `bin/yq.lpscr` entry script, `lib/` modules, relative imports, manifest entry and test pattern
+  - _Requirements: all_
+- [x] 2. Command line: short clusters, long options, `--indent`, `--arg`, usage errors
+  - _Requirements: 1.1, 1.2, 1.3_
+- [x] 3. YAML reading: documents, data.yaml with the rewrites around it, flow collections, block and multi-line scalars, error lines
+  - _Requirements: 2.1, 2.2, 2.3, 2.4_
+- [x] 4. Filter lexer and parser with interpolation, scope and arity checks
+  - _Requirements: 3.1, 3.4_
+- [x] 5. Evaluator as generators, errors carried in the stream
+  - _Requirements: 3.1, 3.5_
+- [x] 6. Value order, equality and arithmetic
+  - _Requirements: 3.3_
+- [x] 7. Builtins and formats
+  - _Requirements: 3.2_
+- [x] 8. Output: JSON, raw, YAML, sorted keys, `-e`
+  - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
+- [x] 9. `-s`, `-n`, `--arg`
+  - _Requirements: 5.1, 5.2, 5.3_
+- [x] 10. Unit tests, fixture, end-to-end tests with `loup run`
+  - _Requirements: all_

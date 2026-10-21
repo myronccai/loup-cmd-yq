@@ -1,16 +1,16 @@
-name = "myapp"
+name = "yq"
 version = "0.1.0"
 loup = "1.26.0"
 authors = []
 
 [build]
-entry = "source/main.loup"
+entry = "bin/yq.lpscr"
 delivery = "cli"
 profile = "release"
 
 [dependencies]
 
 [test]
-pattern = "**/*_test.loup"
+pattern = "**/*_test.lpscr"
 parallel = true
-timeout = 30
+timeout = 60

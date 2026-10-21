@@ -1,0 +1,41 @@
+# Services of a small shop deployment.
+version: 3
+name: shop
+debug: false
+owner: ~
+services:
+  - name: web
+    image: "nginx:1.27"
+    ports: [80, 443]
+    replicas: 2
+    env:
+      LOG_LEVEL: info
+      CACHE_TTL: 300
+  - name: api
+    image: shop/api:2.4.1
+    ports:
+      - 8080
+    replicas: 3
+    env: {LOG_LEVEL: debug, FEATURE_X: true}
+    command: |
+      ./api serve
+      --port 8080
+  - name: db
+    image: postgres:16
+    ports: []
+    replicas: 1
+    volumes:
+      - name: data
+        path: /var/lib/postgresql/data
+    notes: >
+      Primary database.
+      Backed up nightly.
+limits:
+  cpu: 1.5
+  memory: 512Mi
+"quoted key": 'it''s quoted'
+url: http://example.com/#top   # a comment
+---
+# A second document.
+name: staging
+services: []

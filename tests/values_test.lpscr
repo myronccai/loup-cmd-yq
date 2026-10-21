@@ -1,0 +1,81 @@
+@mode(host.scripted)
+
+# Unit tests for yq's value model (lib/values.lpscr): types, truth, jq's
+# order, deep equality, canonical text and the arithmetic operators.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from system.json import (stringify);
+from ..lib.values import (JqError, kind, truthy, compare, equal, canonical, sort_keys, add, subtract, multiply, divide, modulo, number, describe);
+from ..lib.flow import (parse_flow);
+
+func v(text: string): Any {
+    return parse_flow(text);
+}
+
+func failure(a: Any, b: Any, op: string): string {
+    try {
+        if (op == "+") {
+            add(a, b);
+        } else if (op == "-") {
+            subtract(a, b);
+        } else if (op == "*") {
+            multiply(a, b);
+        } else if (op == "/") {
+            divide(a, b);
+        } else {
+            modulo(a, b);
+        }
+    } catch (JqError as e) {
+        return e.message;
+    }
+    return "";
+}
+
+func test_kinds_and_truth(): void {
+    expectEq([kind(None), kind(true), kind(1), kind(1.5), kind("s"), kind(v("[]")), kind(v("{}"))].join(","), "null,boolean,number,number,string,array,object", "kinds");
+    expect(!truthy(None) and !truthy(false), "false and null");
+    expect(truthy(0) and truthy("") and truthy(v("[]")), "everything else");
+}
+
+func test_order(): void {
+    expect(compare(None, false) < 0 and compare(false, true) < 0 and compare(true, 0) < 0, "null < false < true < numbers");
+    expect(compare(100, "a") < 0 and compare("z", v("[]")) < 0 and compare(v("[]"), v("{}")) < 0, "numbers < strings < arrays < objects");
+    expect(compare(1, 1.0) == 0 and compare(2, 1.5) > 0, "numbers by value");
+    expect(compare(v("[1, 2]"), v("[1, 3]")) < 0 and compare(v("[1]"), v("[1, 0]")) < 0, "arrays element by element");
+    expect(compare(v("{a: 2}"), v("{b: 1}")) < 0 and compare(v("{a: 1}"), v("{a: 2}")) < 0, "objects by keys, then values");
+    expect(equal(v("{a: [1, {b: c}]}"), v("{a: [1, {b: c}]}")), "deep equality");
+    expect(!equal(v("[1]"), v("[1, 1]")), "different lengths");
+}
+
+func test_canonical(): void {
+    expectEq(canonical(v("{b: 1, a: [2.0, {d: 1, c: 2}]}")), "{\"a\":[2,{\"c\":2,\"d\":1}],\"b\":1}", "sorted keys, whole floats");
+    expectEq(stringify(sort_keys(v("{b: 1.0, a: 2}"))), "{\"a\":2,\"b\":1.0}", "-S keeps floats");
+    expectEq(stringify(number(4.0)), "4", "whole float");
+    expectEq(stringify(number(2.5)), "2.5", "fraction");
+    expectEq(describe(v("{key: a long value}")), "object ({\"key\":\"a ...)", "described, cut short");
+}
+
+func test_arithmetic(): void {
+    expectEq(stringify(add(1, 2)), "3", "ints");
+    expectEq(stringify(add(1.5, 1.5)), "3", "whole float result");
+    expectEq(stringify(add(None, "x")), "\"x\"", "null is the identity");
+    expectEq(stringify(add(v("{a: 1, b: 1}"), v("{b: 2}"))), "{\"a\":1,\"b\":2}", "objects merge");
+    expectEq(stringify(subtract(v("[1, 2, 1, 3]"), v("[1]"))), "[2,3]", "array difference");
+    expectEq(stringify(multiply(3, 0.5)), "1.5", "multiply");
+    expectEq(stringify(divide(9, 3)), "3", "whole quotient");
+    expectEq(stringify(divide("a,b", ",")), "[\"a\",\"b\"]", "string division splits");
+    expectEq(stringify(modulo(-7, 3)), "-1", "sign of the dividend");
+}
+
+func test_arithmetic_errors(): void {
+    expectEq(failure("a", 1, "+"), "string (\"a\") and number (1) cannot be added", "add");
+    expectEq(failure(1, "a", "-"), "number (1) and string (\"a\") cannot be subtracted", "subtract");
+    expectEq(failure(v("[1]"), 2, "*"), "array ([1]) and number (2) cannot be multiplied", "multiply");
+    expectEq(failure(1, 0, "/"), "number (1) and number (0) cannot be divided because the divisor is zero", "divide by zero");
+    expectEq(failure(5, 0, "%"), "number (5) and number (0) cannot be divided because the divisor is zero", "modulo by zero");
+}

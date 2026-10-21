@@ -1,0 +1,61 @@
+@mode(host.scripted)
+
+# Unit tests for yq's command line (lib/args.lpscr).
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.args import (Options, parse_args, parse_indent);
+
+func ok(argv: list[string]): Options {
+    return parse_args(argv).unwrap();
+}
+
+func err(argv: list[string]): string {
+    match parse_args(argv) {
+        Ok(o) => {
+            return "accepted";
+        },
+        Err(message) => {
+            return message;
+        },
+    }
+}
+
+func test_defaults(): void {
+    let o = ok([".a"]);
+    expectEq(o.filter, ".a", "filter");
+    expectEq(o.files.len(), 0, "standard input");
+    expect(!o.yaml and !o.raw and !o.compact and !o.slurp and !o.null_input and !o.exit_status, "flags off");
+    expectEq(o.indent, 2, "indent");
+}
+
+func test_short_and_long(): void {
+    let o = ok(["-rcS", ".", "a.yaml", "-y", "--slurp", "b.yaml", "--indent", "4", "--null-input"]);
+    expect(o.raw and o.compact and o.sort_keys and o.yaml and o.slurp and o.null_input, "flags");
+    expectEq(o.files.join(","), "a.yaml,b.yaml", "files around options");
+    expectEq(o.indent, 4, "indent");
+    expect(ok(["-j", "."]).raw, "-j implies raw");
+    expectEq(ok(["--indent=0", "."]).indent, 0, "attached");
+}
+
+func test_arg_and_double_dash(): void {
+    let o = ok(["--arg", "who", "you", "--arg", "n", "1", "--arg", "who", "me", "$who", "--", "-file"]);
+    expectEq(o.arg_names.join(","), "who,n", "names once, in order");
+    expectEq(o.arg_values["who"] as string, "me", "last value wins");
+    expectEq(o.files.join(","), "-file", "after --");
+}
+
+func test_errors(): void {
+    expectEq(err([]), "no filter given", "no filter");
+    expect(ok(["-h"]).help and ok(["--version"]).version, "help and version need no filter");
+    expectEq(err(["-x", "."]), "invalid option -- 'x'", "short");
+    expectEq(err(["--bogus", "."]), "unrecognized option '--bogus'", "long");
+    expectEq(err(["--slurp=1", "."]), "option '--slurp' doesn't allow an argument", "value on a flag");
+    expectEq(err(["--indent", "9", "."]), "--indent takes a number from 0 to 7, not '9'", "indent range");
+    expectEq(err(["--arg", "x"]), "--arg takes two parameters (e.g. --arg varname value)", "arg");
+    expect(parse_indent("7") == Some(7) and parse_indent("x").is_none(), "parse_indent");
+}

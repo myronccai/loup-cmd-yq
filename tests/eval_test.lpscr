@@ -1,0 +1,145 @@
+@mode(host.scripted)
+
+# Unit tests for yq's evaluator and builtins (lib/eval.lpscr,
+# lib/builtins.lpscr): filters run on values written as YAML flow
+# collections, their outputs compared as compact JSON.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from system.json import (stringify);
+from ..lib.parser import (compile);
+from ..lib.eval import (Env, run, index_value, slice_value, children);
+from ..lib.flow import (parse_flow);
+from ..lib.values import (JqError, Failure);
+
+let DOC: string = "{name: shop, services: [{name: web, replicas: 2, ports: [80, 443]}, {name: api, replicas: 3, ports: [8080], env: {LEVEL: debug}}], limits: {cpu: 1.5}, owner: null}";
+
+# The outputs of `filter` on `input` (flow YAML), as JSON joined by spaces;
+# an error ends the stream as `error: MESSAGE`.
+func outs(filter: string, input: string): string {
+    var vars: dict[string, Any] = {};
+    vars["who"] = "world";
+    let env = Env(vars, "doc.yaml");
+    var parts: list[string] = [];
+    for (value in run(compile(filter, ["who"]), parse_flow(input), env)) {
+        if (value is Failure) {
+            parts.push("error: " + (value as Failure).message);
+        } else {
+            parts.push(stringify(value));
+        }
+    }
+    return parts.join(" ");
+}
+
+func doc(filter: string): string {
+    return outs(filter, DOC);
+}
+
+# The message of the error a helper throws, or "".
+func failure(f: fn(): Any): string {
+    try {
+        f();
+    } catch (JqError as e) {
+        return e.message;
+    }
+    return "";
+}
+
+func test_paths(): void {
+    expectEq(doc(".name"), "\"shop\"", "field");
+    expectEq(doc(".services[1].name"), "\"api\"", "index");
+    expectEq(doc(".services[-1].replicas"), "3", "negative index");
+    expectEq(doc(".services[].name"), "\"web\" \"api\"", "iterate");
+    expectEq(doc(".missing.deeper"), "null", "null propagates");
+    expectEq(doc(".services[0].ports[1:]"), "[443]", "slice");
+    expectEq(doc(".[\"name\"], .\"name\""), "\"shop\" \"shop\"", "quoted keys");
+    expectEq(outs("[..] | length", "{a: [1, {b: 2}]}"), "5", "recursive descent");
+}
+
+func test_pipes_and_construction(): void {
+    expectEq(doc("[.services[] | .replicas]"), "[2,3]", "collect");
+    expectEq(doc(".services[] | {name, n: .replicas}"), "{\"name\":\"web\",\"n\":2} {\"name\":\"api\",\"n\":3}", "objects");
+    expectEq(outs("{a: (1, 2), b: (3, 4)}", "null"), "{\"a\":1,\"b\":3} {\"a\":1,\"b\":4} {\"a\":2,\"b\":3} {\"a\":2,\"b\":4}", "every combination");
+    expectEq(doc("{(.name): .limits.cpu}"), "{\"shop\":1.5}", "computed key");
+    expectEq(doc(".services[] | \"\\(.name)=\\(.ports)\""), "\"web=[80,443]\" \"api=[8080]\"", "interpolation");
+    expectEq(outs("[(1, 2) + (10, 20)]", "null"), "[11,12,21,22]", "jq's order of combinations");
+}
+
+func test_operators(): void {
+    expectEq(outs("1 + 2 * 3, 7 / 2, 7 % 3, 10 / 5", "null"), "7 3.5 1 2", "arithmetic");
+    expectEq(outs("[1, 2] + [3], {a: 1} + {b: 2}, \"a\" + \"b\", null + 1", "null"), "[1,2,3] {\"a\":1,\"b\":2} \"ab\" 1", "addition");
+    expectEq(outs("[1, 2, 2, 3] - [2]", "null"), "[1,3]", "array difference");
+    expectEq(outs("{a: {b: 1}} * {a: {c: 2}}", "null"), "{\"a\":{\"b\":1,\"c\":2}}", "deep merge");
+    expectEq(outs("1 < 2, \"a\" < \"b\", [1] == [1], {a: 1} != {a: 1}, null < false", "null"), "true true true false true", "comparisons");
+    expectEq(outs("true and false, false or true, (null // 5), (false // empty // 7)", "null"), "false true 5 7", "logic and alternative");
+    expectEq(doc("-.limits.cpu"), "-1.5", "negation");
+}
+
+func test_conditionals_and_variables(): void {
+    expectEq(doc(".services[] | if .replicas > 2 then \"big\" elif .replicas > 1 then \"medium\" else \"small\" end"), "\"medium\" \"big\"", "if/elif");
+    expectEq(outs("if . then 1 end", "false"), "false", "no else");
+    expectEq(doc(".name as $n | .services[] | \"\\($n)/\\(.name)\""), "\"shop/web\" \"shop/api\"", "binding");
+    expectEq(outs("$who", "null"), "\"world\"", "--arg variable");
+}
+
+func test_errors(): void {
+    expectEq(failure(func(): Any { return index_value(5, "a"); }), "Cannot index number with string \"a\"", "index a number");
+    expectEq(failure(func(): Any { return index_value(parse_flow("{a: 1}"), 0); }), "Cannot index object with number", "index an object");
+    expectEq(failure(func(): Any { return children(None); }), "Cannot iterate over null (null)", "iterate null");
+    expectEq(failure(func(): Any { return slice_value(5, 0, 1); }), "Cannot index number with object", "slice a number");
+    expectEq(outs(".a + 1", "{a: x}"), "error: string (\"x\") and number (1) cannot be added", "in the stream");
+    expectEq(outs(".[] | 10 / .", "[5, 0, 2]"), "2 error: number (10) and number (0) cannot be divided because the divisor is zero", "outputs before the error stand");
+    expectEq(outs("1, error(\"custom\"), 2", "null"), "1 error: custom", "error/1 ends the stream");
+    expectEq(outs("{} | error", "null"), "error: {} (not a string)", "error/0 on an object");
+}
+
+func test_try_and_alternative(): void {
+    expectEq(outs("[.[] | .a?]", "[{a: 1}, 2, {a: 3}]"), "[1,3]", "postfix ? skips errors");
+    expectEq(outs("[(1, error(\"x\"), 2)?]", "null"), "[1]", "? keeps the outputs before an error");
+    expectEq(outs(".a // \"default\"", "5"), "\"default\"", "// hides the error");
+    expectEq(outs("[.[]?]", "3"), "[]", "iterating a number, quietly");
+}
+
+func test_builtins(): void {
+    expectEq(doc(".services | map(.replicas) | add"), "5", "map and add");
+    expectEq(doc(".services | map(select(.replicas > 2) | .name)"), "[\"api\"]", "select");
+    expectEq(doc("keys, (.services | length), (.name | length)"), "[\"limits\",\"name\",\"owner\",\"services\"] 2 4", "keys and length");
+    expectEq(doc("keys_unsorted"), "[\"name\",\"services\",\"limits\",\"owner\"]", "keys in order");
+    expectEq(doc("[.services[] | has(\"env\")]"), "[false,true]", "has");
+    expectEq(doc(".limits | to_entries"), "[{\"key\":\"cpu\",\"value\":1.5}]", "to_entries");
+    expectEq(doc(".limits | with_entries({key: (.key | ascii_upcase), value})"), "{\"CPU\":1.5}", "with_entries");
+    expectEq(outs("map_values(. + 1)", "{a: 1, b: 2}"), "{\"a\":2,\"b\":3}", "map_values");
+    expectEq(outs("map_values(empty)", "[1, 2]"), "[]", "map_values drops empty");
+    expectEq(outs("[.. | numbers], [.. | strings], [paths]", "{a: [1, x]}"), "[1] [\"x\"] [[\"a\"],[\"a\",0],[\"a\",1]]", "selectors and paths");
+    expectEq(outs("type", "[]"), "\"array\"", "type");
+    expectEq(outs("input_filename", "null"), "\"doc.yaml\"", "input_filename");
+}
+
+func test_sorting_and_grouping(): void {
+    expectEq(outs("sort", "[3, a, null, true, [1], {a: 1}, 1.5]"), "[null,true,1.5,3,\"a\",[1],{\"a\":1}]", "jq order");
+    expectEq(outs("sort_by(.n) | map(.k)", "[{k: a, n: 2}, {k: b, n: 1}, {k: c, n: 2}]"), "[\"b\",\"a\",\"c\"]", "stable sort_by");
+    expectEq(outs("group_by(.n) | map(map(.k))", "[{k: a, n: 2}, {k: b, n: 1}, {k: c, n: 2}]"), "[[\"b\"],[\"a\",\"c\"]]", "group_by");
+    expectEq(outs("unique, (unique_by(type) | length)", "[b, a, b, 1, 1.0]"), "[1,\"a\",\"b\"] 2", "unique");
+    expectEq(outs("min, max, (min_by(-.) ), reverse", "[3, 1, 2]"), "1 3 3 [2,1,3]", "min, max, reverse");
+    expectEq(outs("[], ([] | min)", "null"), "[] null", "empty array");
+}
+
+func test_strings(): void {
+    expectEq(outs("split(\", \"), ascii_upcase, startswith(\"a\"), endswith(\"c\")", "\"a, b, c\""), "[\"a\",\"b\",\"c\"] \"A, B, C\" true true", "string builtins");
+    expectEq(outs("join(\"-\")", "[a, 1, null, true]"), "\"a-1--true\"", "join");
+    expectEq(outs("ltrimstr(\"x\"), rtrimstr(\"z\"), tostring, (\"42\" | tonumber)", "xyz"), "\"yz\" \"xy\" \"xyz\" 42", "trim and convert");
+    expectEq(outs("contains(\"b\"), ([1, [2]] | contains([[2]]))", "abc"), "true true", "contains");
+    expectEq(outs("@csv, @tsv, @sh, @json", "[a, \"b,c\", 1]"), "\"\\\"a\\\",\\\"b,c\\\",1\" \"a\\tb,c\\t1\" \"'a' 'b,c' 1\" \"[\\\"a\\\",\\\"b,c\\\",1]\"", "formats");
+    expectEq(outs("@sh \"rm \\(.)\"", "\"my file\""), "\"rm 'my file'\"", "format string");
+}
+
+func test_ranges_and_limits(): void {
+    expectEq(outs("[range(3)], [range(1; 7; 2)], [range(3; 0; -1)]", "null"), "[0,1,2] [1,3,5] [3,2,1]", "range");
+    expectEq(outs("[limit(2; .[])], first(.[]), first, last", "[5, 6, 7]"), "[5,6] 5 5 7", "limit and first");
+    expectEq(outs("flatten, flatten(1)", "[1, [2, [3]]]"), "[1,2,3] [1,2,[3]]", "flatten");
+    expectEq(outs("any, all, any(. > 2), all(. > 0)", "[1, 2, 3]"), "true true true true", "any and all");
+}

@@ -1,0 +1,79 @@
+@mode(host.scripted)
+
+# Unit tests for yq's YAML reading (lib/yamlin.lpscr, lib/flow.lpscr):
+# documents, compact sequences, flow collections, block scalars, quoting,
+# comments and error lines.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from system.json import (stringify);
+from ..lib.yamlin import (InputError, read_values, documents, mapping_colon);
+from ..lib.flow import (parse_flow, scalar_value);
+
+# Every document of `text` as compact JSON (an unreadable one as its error).
+func read(text: string): string {
+    var out: list[string] = [];
+    for (value in read_values(text, "t.yaml")) {
+        if (value is InputError) {
+            out.push("ERROR " + (value as InputError).message);
+        } else {
+            out.push(stringify(value));
+        }
+    }
+    return out.join(" | ");
+}
+
+func test_documents(): void {
+    var firsts: list[string] = [];
+    for (doc in documents("a: 1\n---\n# only a comment\n---\nb: 2\n...\n")) {
+        firsts.push(str(doc.first));
+    }
+    expectEq(firsts.join(","), "1,5", "empty documents are skipped");
+    expectEq(read("---\na: 1\n---\nb: 2\n"), "{\"a\":1} | {\"b\":2}", "two documents");
+}
+
+func test_block_structure(): void {
+    expectEq(read("a: 1\nb:\n  c: x\n  d: [1, 2]\n"), "{\"a\":1,\"b\":{\"c\":\"x\",\"d\":[1,2]}}", "nested mapping");
+    expectEq(read("items:\n  - name: a\n    port: 80\n  - name: b\n"), "{\"items\":[{\"name\":\"a\",\"port\":80},{\"name\":\"b\"}]}", "compact sequence of mappings");
+    expectEq(read("items:\n- a\n- - b\n  - c\n"), "{\"items\":[\"a\",[\"b\",\"c\"]]}", "unindented and nested sequences");
+    expectEq(read("- 1\n- {k: v}\n- [x, \"y\"]\n"), "[1,{\"k\":\"v\"},[\"x\",\"y\"]]", "top-level sequence");
+}
+
+func test_scalars(): void {
+    expectEq(read("a: 1\nb: -2.5\nc: true\nd: ~\ne:\nf: 010\ng: 0x10\nh: 1e3\n"), "{\"a\":1,\"b\":-2.5,\"c\":true,\"d\":null,\"e\":null,\"f\":10,\"g\":\"0x10\",\"h\":1000.0}", "types");
+    expectEq(read("a: \"x: y\"\nb: 'it''s'\nc: \"tab\\there\"\n\"q k\": 1\n'p': 2\n"), "{\"a\":\"x: y\",\"b\":\"it's\",\"c\":\"tab\\there\",\"q k\":1,\"p\":2}", "quoting");
+    expectEq(read("url: http://h/#frag  # comment\nn: 5 # five\n"), "{\"url\":\"http://h/#frag\",\"n\":5}", "comments");
+    expectEq(read("just text\n"), "\"just text\"", "a scalar document");
+    expect(scalar_value("yes") == "yes", "yes is a string");
+}
+
+func test_block_scalars(): void {
+    expectEq(read("a: |\n  one\n  two\n\nb: 1\n"), "{\"a\":\"one\\ntwo\\n\",\"b\":1}", "literal, clipped");
+    expectEq(read("a: |-\n  one\n    two\n"), "{\"a\":\"one\\n  two\"}", "literal, stripped, inner indent kept");
+    expectEq(read("a: |+\n  one\n\n\nb: 1\n"), "{\"a\":\"one\\n\\n\\n\",\"b\":1}", "literal, kept");
+    expectEq(read("a: >\n  one\n  two\n\n  three\n"), "{\"a\":\"one two\\nthree\\n\"}", "folded");
+    expectEq(read("- >-\n  x\n  y\n"), "[\"x y\"]", "in a sequence");
+}
+
+func test_flow(): void {
+    expectEq(stringify(parse_flow("{a: [1, {b: \"c, d\"}], e: , 'f': g h}")), "{\"a\":[1,{\"b\":\"c, d\"}],\"e\":null,\"f\":\"g h\"}", "nested");
+    expectEq(read("a: [1,\n    2, 3]\nb: {x: 1,\n    y: 2}\n"), "{\"a\":[1,2,3],\"b\":{\"x\":1,\"y\":2}}", "over several lines");
+    expectEq(read("a: []\nb: {}\n"), "{\"a\":[],\"b\":{}}", "empty");
+}
+
+func test_mapping_colon(): void {
+    expectEq(mapping_colon("key: value"), 3, "plain");
+    expectEq(mapping_colon("key:"), 3, "no value");
+    expectEq(mapping_colon("http://x"), -1, "a colon without a space");
+    expectEq(mapping_colon("\"a: b\": c"), 6, "quoted key");
+    expectEq(mapping_colon("[a: b]"), -1, "flow");
+}
+
+func test_errors(): void {
+    expectEq(read("a: 1\n---\nb: [1\nc: 2\n---\nd: 4\n"), "{\"a\":1} | ERROR t.yaml:3: unterminated flow collection | {\"d\":4}", "the other documents still read");
+    expectEq(read("a:\n  b: 1\n c: 2\n"), "ERROR t.yaml:3: unexpected indent", "line of the original file");
+}

@@ -1,0 +1,171 @@
+@mode(host.scripted)
+
+# yq's command line: jq's options (plus -y), a filter and files.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Grammar: yq [OPTION]... FILTER [FILE]... Short options combine (`-rc`);
+# long options are `--name` (and `--indent N` / `--indent=N`, `--arg NAME
+# VALUE`); options may come anywhere before `--`. The first operand is the
+# filter, the others are files.
+
+pub class Options {
+    pub var filter: string = "";
+    pub var has_filter: bool = false;
+    pub var files: list[string] = [];
+    pub var yaml: bool = false;
+    pub var raw: bool = false;
+    pub var join: bool = false;
+    pub var compact: bool = false;
+    pub var sort_keys: bool = false;
+    pub var slurp: bool = false;
+    pub var null_input: bool = false;
+    pub var exit_status: bool = false;
+    pub var indent: int = 2;
+    # --arg NAME VALUE pairs: the names in order, the values by name.
+    pub var arg_names: list[string] = [];
+    pub var arg_values: dict[string, Any] = {};
+    pub var help: bool = false;
+    pub var version: bool = false;
+}
+
+# The long name of each short option.
+let SHORT: dict[string, string] = {
+    "y": "yaml-output",
+    "r": "raw-output",
+    "j": "join-output",
+    "c": "compact-output",
+    "S": "sort-keys",
+    "s": "slurp",
+    "n": "null-input",
+    "e": "exit-status",
+    "h": "help",
+    "V": "version",
+};
+
+# Sets the flag a long option names; false when it names none.
+safe func set_flag(edits o: Options, name: string): bool {
+    if (name == "yaml-output") {
+        o.yaml = true;
+    } else if (name == "raw-output") {
+        o.raw = true;
+    } else if (name == "join-output") {
+        o.join = true;
+        o.raw = true;
+    } else if (name == "compact-output") {
+        o.compact = true;
+    } else if (name == "sort-keys") {
+        o.sort_keys = true;
+    } else if (name == "slurp") {
+        o.slurp = true;
+    } else if (name == "null-input") {
+        o.null_input = true;
+    } else if (name == "exit-status") {
+        o.exit_status = true;
+    } else if (name == "help") {
+        o.help = true;
+    } else if (name == "version") {
+        o.version = true;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+# A JSON indent: a whole number from 0 to 7.
+pub func parse_indent(text: string): int? {
+    if (text.len() != 1 or !"01234567".contains(text)) {
+        return None;
+    }
+    return Some(text.toInt());
+}
+
+pub func parse_args(argv: list[string]): Result[Options, string] {
+    let o = Options();
+    var only_operands = false;
+    var i = 0;
+    while (i < argv.len()) {
+        let word = argv[i];
+        i += 1;
+        if (only_operands or word == "-" or !word.startsWith("-")) {
+            safe {
+                if (o.has_filter) {
+                    o.files.push(word);
+                } else {
+                    o.filter = word;
+                    o.has_filter = true;
+                }
+            }
+            continue;
+        }
+        if (word == "--") {
+            only_operands = true;
+            continue;
+        }
+        if (word.startsWith("--")) {
+            let eq = word.index_of("=");
+            let name = if (eq >= 0) { word.slice(2, eq) } else { word.slice(2) };
+            if (name == "indent") {
+                var text = "";
+                if (eq >= 0) {
+                    text = word.slice(eq + 1);
+                } else if (i < argv.len()) {
+                    text = argv[i];
+                    i += 1;
+                } else {
+                    return Err("option '--indent' requires an argument");
+                }
+                match parse_indent(text) {
+                    Some(n) => {
+                        safe {
+                            o.indent = n;
+                        }
+                    },
+                    None => {
+                        return Err("--indent takes a number from 0 to 7, not '" + text + "'");
+                    },
+                }
+                continue;
+            }
+            if (name == "arg") {
+                if (eq >= 0 or i + 1 >= argv.len()) {
+                    return Err("--arg takes two parameters (e.g. --arg varname value)");
+                }
+                let var_name = argv[i];
+                let value = argv[i + 1];
+                i += 2;
+                safe {
+                    if (!o.arg_names.contains(var_name)) {
+                        o.arg_names.push(var_name);
+                    }
+                    o.arg_values[var_name] = value;
+                }
+                continue;
+            }
+            if (eq >= 0) {
+                return Err("option '--" + name + "' doesn't allow an argument");
+            }
+            if (!set_flag(edits: o, name)) {
+                return Err("unrecognized option '" + word + "'");
+            }
+            continue;
+        }
+        # A cluster of short options: `-rc`.
+        for (letter in word.slice(1)) {
+            match SHORT.get(letter) {
+                Some(name) => {
+                    set_flag(edits: o, name);
+                },
+                None => {
+                    return Err("invalid option -- '" + letter + "'");
+                },
+            }
+        }
+    }
+    if (!o.has_filter and !o.help and !o.version) {
+        return Err("no filter given");
+    }
+    return Ok(o);
+}

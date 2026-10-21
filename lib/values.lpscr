@@ -1,0 +1,427 @@
+@mode(host.scripted)
+
+# yq's values: the JSON data model (null, booleans, numbers, strings, arrays,
+# objects) carried in Loup's Any, with jq's type names, truth, order,
+# equality and arithmetic.
+#
+# Runtime: host.scripted. A module of the script bin/yq.lpscr, interpreted
+# with it by `loup run`; the unit tests import it under Stage0's test runner
+# (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: as_array() and as_object() are safe casts (`as?`) and kind()
+# classifies a value by matching its type; everything else recurses over
+# arrays and objects through them: compare() gives jq's total order, which
+# also decides equality, and canonical() a text that equal values share.
+
+from system.json import (stringify);
+from system.collections import (mergeWith, sortBy);
+
+# A failure while running a filter. bin/yq.lpscr reports it as
+# `yq: error: MESSAGE` and goes on with the next input.
+pub class JqError : Exception {
+    new(message: string) {
+        super(message);
+    }
+}
+
+# An error travelling in a stream of outputs. A generator never lets an
+# exception leave its own body: Stage0 cannot catch one that does, and the
+# self-hosted `loup run` (which runs a generator to its end before the loop
+# over it starts) would lose the outputs before it. So each generator
+# catches JqError, yields a Failure and stops, and its consumer throws it
+# again with unwrap(), inside its own body.
+pub class Failure {
+    pub let message: string;
+
+    new(message: string) {
+        this.message = message;
+    }
+}
+
+# A value taken from a stream, or the error it carries, thrown again.
+pub func unwrap(v: Any): Any {
+    if (v is Failure) {
+        throw JqError((v as Failure).message);
+    }
+    return v;
+}
+
+pub func as_array(v: Any): list[Any]? {
+    return v as? list[Any];
+}
+
+pub func as_object(v: Any): dict[string, Any]? {
+    return v as? dict[string, Any];
+}
+
+# jq's name for the type of a value.
+pub func kind(v: Any): string {
+    if (v == None) {
+        return "null";
+    }
+    match v {
+        bool(b) => {
+            return "boolean";
+        },
+        int(n) => {
+            return "number";
+        },
+        float(f) => {
+            return "number";
+        },
+        string(s) => {
+            return "string";
+        },
+        _ => {},
+    }
+    if (as_array(v).is_some()) {
+        return "array";
+    }
+    return "object";
+}
+
+# false and null are false; everything else is true.
+pub func truthy(v: Any): bool {
+    if (v == None) {
+        return false;
+    }
+    match v {
+        bool(b) => {
+            return b;
+        },
+        _ => {
+            return true;
+        },
+    }
+}
+
+pub func is_number(v: Any): bool {
+    return kind(v) == "number";
+}
+
+pub func to_float(v: Any): float {
+    match v {
+        int(n) => {
+            return n as float;
+        },
+        float(f) => {
+            return f;
+        },
+        _ => {
+            throw JqError(describe(v) + " is not a number");
+        },
+    }
+}
+
+# A value in an error message: its type and its JSON, cut short as jq does.
+pub func describe(v: Any): string {
+    var text = stringify(v);
+    if (text.len() > 11) {
+        text = text.slice(0, 10) + "...";
+    }
+    return kind(v) + " (" + text + ")";
+}
+
+# jq's order of types: null < false < true < numbers < strings < arrays < objects.
+func rank(v: Any): int {
+    let k = kind(v);
+    if (k == "boolean") {
+        return if (truthy(v)) { 2 } else { 1 };
+    }
+    return match k {
+        "null" => 0,
+        "number" => 3,
+        "string" => 4,
+        "array" => 5,
+        _ => 6,
+    };
+}
+
+func sign(n: int): int {
+    return if (n < 0) { -1 } else if (n > 0) { 1 } else { 0 };
+}
+
+# The sorted keys of an object.
+pub func sorted_keys(d: dict[string, Any]): list[string] {
+    var keys: list[string] = [];
+    for (key in d.keys()) {
+        keys.push(key);
+    }
+    return sortBy(keys, func(key: string): string { return key; });
+}
+
+# jq's total order: -1, 0 or 1. Arrays compare element by element, objects
+# first by their sorted key lists and then by the values under those keys.
+pub func compare(a: Any, b: Any): int {
+    let ra = rank(a);
+    let rb = rank(b);
+    if (ra != rb) {
+        return sign(ra - rb);
+    }
+    if (ra == 3) {
+        let x = to_float(a);
+        let y = to_float(b);
+        return if (x < y) { -1 } else if (x > y) { 1 } else { 0 };
+    }
+    if (ra == 4) {
+        return sign((a as string).compareTo(b as string));
+    }
+    if (ra == 5) {
+        let xs = as_array(a)!;
+        let ys = as_array(b)!;
+        var k = 0;
+        while (k < xs.len() and k < ys.len()) {
+            let c = compare(xs[k], ys[k]);
+            if (c != 0) {
+                return c;
+            }
+            k += 1;
+        }
+        return sign(xs.len() - ys.len());
+    }
+    if (ra == 6) {
+        let x = as_object(a)!;
+        let y = as_object(b)!;
+        let xkeys = sorted_keys(x);
+        var xlist: list[Any] = [];
+        for (key in xkeys) {
+            xlist.push(key);
+        }
+        var ylist: list[Any] = [];
+        for (key in sorted_keys(y)) {
+            ylist.push(key);
+        }
+        let by_keys = compare(xlist, ylist);
+        if (by_keys != 0) {
+            return by_keys;
+        }
+        for (key in xkeys) {
+            let c = compare(x[key], y[key]);
+            if (c != 0) {
+                return c;
+            }
+        }
+    }
+    return 0;
+}
+
+# Deep equality (list `==` does not compare elements in Loup 1.26).
+pub func equal(a: Any, b: Any): bool {
+    return compare(a, b) == 0;
+}
+
+# The value with every object's keys sorted, at every level (-S, and the
+# canonical form below).
+pub func sort_keys(v: Any): Any {
+    match as_array(v) {
+        Some(xs) => {
+            var out: list[Any] = [];
+            for (x in xs) {
+                out.push(sort_keys(x));
+            }
+            return out;
+        },
+        None => {},
+    }
+    match as_object(v) {
+        Some(d) => {
+            var out: dict[string, Any] = {};
+            for (key in sorted_keys(d)) {
+                out[key] = sort_keys(d[key]);
+            }
+            return out;
+        },
+        None => {
+            return v;
+        },
+    }
+}
+
+# A text that equal values share: their JSON with sorted keys and whole
+# floats written as integers (1.0 == 1 in jq). Used as a dictionary key
+# when grouping or removing duplicates.
+pub func canonical(v: Any): string {
+    return stringify(canonical_value(sort_keys(v)));
+}
+
+func canonical_value(v: Any): Any {
+    match v {
+        float(f) => {
+            return number(f);
+        },
+        _ => {},
+    }
+    match as_array(v) {
+        Some(items) => {
+            var out: list[Any] = [];
+            for (item in items) {
+                out.push(canonical_value(item));
+            }
+            return out;
+        },
+        None => {},
+    }
+    match as_object(v) {
+        Some(members) => {
+            var out: dict[string, Any] = {};
+            for (key in members.keys()) {
+                out[key] = canonical_value(members[key]);
+            }
+            return out;
+        },
+        None => {
+            return v;
+        },
+    }
+}
+
+# A number that is whole as an int, otherwise the float.
+pub func number(f: float): Any {
+    let whole = f as int;
+    if ((whole as float) == f and f < 9007199254740992.0 and f > -9007199254740992.0) {
+        return whole;
+    }
+    return f;
+}
+
+func both_ints(a: Any, b: Any): bool {
+    match a {
+        int(x) => {
+            match b {
+                int(y) => {
+                    return true;
+                },
+                _ => {
+                    return false;
+                },
+            }
+        },
+        _ => {
+            return false;
+        },
+    }
+}
+
+# `+`: numbers add, strings and arrays concatenate, objects merge (the right
+# one wins), and null is the identity.
+pub func add(a: Any, b: Any): Any {
+    if (a == None) {
+        return b;
+    }
+    if (b == None) {
+        return a;
+    }
+    let ka = kind(a);
+    if (ka != kind(b)) {
+        throw JqError(describe(a) + " and " + describe(b) + " cannot be added");
+    }
+    if (ka == "number") {
+        if (both_ints(a, b)) {
+            return (a as int) + (b as int);
+        }
+        return number(to_float(a) + to_float(b));
+    }
+    if (ka == "string") {
+        return (a as string) + (b as string);
+    }
+    if (ka == "array") {
+        let joined: list[Any] = as_array(a)! + as_array(b)!;
+        return joined;
+    }
+    if (ka == "object") {
+        return mergeWith(as_object(a)!, as_object(b)!, func(left: Any, right: Any): Any { return right; });
+    }
+    throw JqError(describe(a) + " and " + describe(b) + " cannot be added");
+}
+
+# `-`: numbers subtract; an array loses every element equal to one in `b`.
+pub func subtract(a: Any, b: Any): Any {
+    if (is_number(a) and is_number(b)) {
+        if (both_ints(a, b)) {
+            return (a as int) - (b as int);
+        }
+        return number(to_float(a) - to_float(b));
+    }
+    match as_array(a) {
+        Some(xs) => {
+            match as_array(b) {
+                Some(drop) => {
+                    var out: list[Any] = [];
+                    for (x in xs) {
+                        var keep = true;
+                        for (d in drop) {
+                            if (equal(x, d)) {
+                                keep = false;
+                            }
+                        }
+                        if (keep) {
+                            out.push(x);
+                        }
+                    }
+                    return out;
+                },
+                None => {},
+            }
+        },
+        None => {},
+    }
+    throw JqError(describe(a) + " and " + describe(b) + " cannot be subtracted");
+}
+
+# `*`: numbers multiply; objects merge recursively.
+pub func multiply(a: Any, b: Any): Any {
+    if (is_number(a) and is_number(b)) {
+        if (both_ints(a, b)) {
+            return (a as int) * (b as int);
+        }
+        return number(to_float(a) * to_float(b));
+    }
+    match as_object(a) {
+        Some(x) => {
+            match as_object(b) {
+                Some(y) => {
+                    return mergeWith(x, y, func(left: Any, right: Any): Any {
+                        if (as_object(left).is_some() and as_object(right).is_some()) {
+                            return multiply(left, right);
+                        }
+                        return right;
+                    });
+                },
+                None => {},
+            }
+        },
+        None => {},
+    }
+    throw JqError(describe(a) + " and " + describe(b) + " cannot be multiplied");
+}
+
+# `/`: numbers divide (whole results stay whole); a string divided by a
+# string is split at it.
+pub func divide(a: Any, b: Any): Any {
+    if (is_number(a) and is_number(b)) {
+        if (to_float(b) == 0.0) {
+            throw JqError(describe(a) + " and " + describe(b) + " cannot be divided because the divisor is zero");
+        }
+        return number(to_float(a) / to_float(b));
+    }
+    if (kind(a) == "string" and kind(b) == "string") {
+        var parts: list[Any] = [];
+        for (part in (a as string).split(b as string)) {
+            parts.push(part);
+        }
+        return parts;
+    }
+    throw JqError(describe(a) + " and " + describe(b) + " cannot be divided");
+}
+
+# `%`: the remainder of whole numbers, with the sign of the dividend.
+pub func modulo(a: Any, b: Any): Any {
+    if (is_number(a) and is_number(b)) {
+        let divisor = to_float(b) as int;
+        if (divisor == 0) {
+            throw JqError(describe(a) + " and " + describe(b) + " cannot be divided because the divisor is zero");
+        }
+        return (to_float(a) as int) % divisor;
+    }
+    throw JqError(describe(a) + " and " + describe(b) + " cannot be divided");
+}

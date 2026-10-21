@@ -1,0 +1,35 @@
+@mode(host.scripted)
+
+# Unit tests for yq's output (lib/output.lpscr): JSON styles, raw strings,
+# sorted keys and the YAML writer.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expectEq);
+from ..lib.output import (make_style, render, to_yaml);
+from ..lib.flow import (parse_flow);
+
+func test_json(): void {
+    let v = parse_flow("{b: [1, x], a: null}");
+    expectEq(render(v, make_style(false, false, 0, false)), "{\"b\":[1,\"x\"],\"a\":null}", "compact");
+    expectEq(render(v, make_style(false, false, 2, true)), "{\n  \"a\": null,\n  \"b\": [\n    1,\n    \"x\"\n  ]\n}", "indented, sorted");
+    expectEq(render("text", make_style(false, true, 2, false)), "text", "raw string");
+    expectEq(render(5, make_style(false, true, 2, false)), "5", "raw number");
+}
+
+func test_yaml_structure(): void {
+    let v = parse_flow("{name: shop, services: [{name: web, ports: [80, 443]}, {name: db, env: {}}], tags: []}");
+    expectEq(to_yaml(v), "name: shop\nservices:\n  - name: web\n    ports:\n      - 80\n      - 443\n  - name: db\n    env: {}\ntags: []", "nested");
+    expectEq(to_yaml(parse_flow("[[1, 2], [3]]")), "- - 1\n  - 2\n- - 3", "sequence of sequences");
+    expectEq(to_yaml(parse_flow("[]")), "[]", "empty");
+}
+
+func test_yaml_scalars(): void {
+    let v = parse_flow("{a: \"true\", b: \"12\", c: \"x: y\", d: \"\", e: \"-dash\", f: plain text, g: null, h: 1.5, \"k k\": 1}");
+    expectEq(to_yaml(v), "a: \"true\"\nb: \"12\"\nc: \"x: y\"\nd: \"\"\ne: \"-dash\"\nf: plain text\ng: null\nh: 1.5\nk k: 1", "quoted when needed");
+    expectEq(to_yaml(parse_flow("{msg: \"one\\ntwo\\n\", raw: \"a\\nb\"}")), "msg: |\n  one\n  two\nraw: |-\n  a\n  b", "block scalars");
+    expectEq(to_yaml("plain"), "plain", "a scalar result");
+}
